@@ -468,11 +468,14 @@ class AudioDataset(Dataset):
         nyquist = self.data_cfg.sample_rate / 2.0
         high_freq = min(high_freq, nyquist - 100.0)
         low_freq = max(50.0, min(low_freq, high_freq - 100.0))
+        center_freq = (low_freq + high_freq) / 2.0
+        bandwidth = max(high_freq - low_freq, 100.0)
+        q_factor = max(center_freq / bandwidth, 0.1)
         filtered = torchaudio.functional.bandpass_biquad(
             noise.unsqueeze(0),
             self.data_cfg.sample_rate,
-            center_freq=(low_freq + high_freq) / 2.0,
-            Q=1.0,
+            center_freq,
+            q_factor,
         ).squeeze(0)
         noise_level = random.uniform(0.001, 0.01)
         return segment + filtered * noise_level
