@@ -455,7 +455,7 @@ class AudioDataset(Dataset):
             self.data_cfg.sample_rate,
             center_freq,
             gain_db,
-            q=q,
+            Q=q,
         )
         return eq.squeeze(0)
 
