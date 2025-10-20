@@ -613,6 +613,14 @@ class DepressionClassifier(nn.Module):
             )
             self.layer_weights = nn.Parameter(torch.ones(n_hidden + 1))
 
+        if self.wavlm_trainable and self.use_layer_weighting:
+            logger.warning(
+                "Disabling layer weighting because WavLM layers are unfrozen; "
+                "requesting all hidden states with gradients greatly increases memory usage."
+            )
+            self.use_layer_weighting = False
+            self.layer_weights = None
+
         self.pooling = AttentiveStatisticsPooling(model_cfg.hidden_dim)
         self.classifier = nn.Sequential(
             nn.Linear(model_cfg.hidden_dim * 2, 256),
