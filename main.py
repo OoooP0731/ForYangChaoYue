@@ -1,7 +1,8 @@
 import logging
+import math
 import os
-import warnings
 import random
+import warnings
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -12,6 +13,7 @@ import pandas as pd
 import soundfile as sf
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import torchaudio
 from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, roc_auc_score
@@ -26,18 +28,21 @@ logger = logging.getLogger(__name__)
 
 
 def _safe_model_tag(model_name: str) -> str:
-    tag = model_name.replace("/", "_").replace(":", "_")
-    return tag
+    return model_name.replace("/", "_").replace(":", "_")
 
 
 @dataclass
 class DataConfig:
     data_dir: str = "./audio_lanzhou_2015"
     sample_rate: int = 16000
-    segment_duration: int = 10
-    overlap_ratio: float = 0.2
+    segment_duration: int = 3
+    overlap_ratio: float = 0.0
     max_segments_per_subject: Optional[int] = None
     apply_augmentation: bool = True
+    augmentation_prob: float = 0.6
+    musan_dir: Optional[str] = None
+    dns_dir: Optional[str] = None
+    rir_dir: Optional[str] = None
     normalize_amplitude: bool = True
     apply_silence_trim: bool = True
     silence_frame_ms: int = 25
@@ -45,9 +50,10 @@ class DataConfig:
     silence_energy_threshold: float = 1e-4
     apply_median_filter: bool = True
     median_filter_kernel: int = 5
-    generate_hamming_frames: bool = False
-    frame_length_ms: int = 25
-    frame_overlap_ms: int = 15
+    feature_type: str = "pretrained"  # "pretrained" or "fbank"
+    fbank_num_mel: int = 40
+    fbank_frame_length_ms: int = 25
+    fbank_frame_shift_ms: int = 10
 
 
 @dataclass
@@ -59,6 +65,8 @@ class ModelConfig:
     local_files_only: bool = True
     force_offline: bool = True
     use_layer_weighting: bool = True
+    ecapa_channels: int = 512
+    embedding_dim: int = 192
 
     @property
     def tag(self) -> str:
@@ -70,7 +78,6 @@ class TrainConfig:
     batch_size: int = 128
     num_workers: int = 4
     persistent_workers: bool = True
-    num_epochs: int = 100
     head_learning_rate: float = 5e-5
     backbone_learning_rate: float = 3e-5
     weight_decay: float = 1e-5
@@ -91,6 +98,13 @@ class TrainConfig:
     max_nan_warnings: int = 3
     nan_lr_scale: float = 0.5
     disable_amp_on_nan: bool = True
+    fbank_epochs: int = 165
+    pretrained_freeze_epochs: int = 20
+    pretrained_finetune_epochs: int = 5
+    aam_margin: float = 0.2
+    aam_scale: float = 30.0
+    inter_topk: int = 5
+    inter_margin: float = 0.1
 
 
 @dataclass
@@ -139,8 +153,6 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-
-# Utility function
 
 def natural_key(path: str) -> Tuple[int, str]:
     base = os.path.splitext(os.path.basename(path))[0]
@@ -246,7 +258,59 @@ def split_by_subject(
     return train_data, val_data, test_data
 
 
-# Audio preprocessing
+def split_by_subject(
+    file_paths: List[str],
+    labels: List[int],
+    subjects: List[str],
+    train_cfg: TrainConfig,
+) -> Tuple[Dict[str, List], Dict[str, List], Dict[str, List]]:
+    subject_to_label: Dict[str, int] = {}
+    for subject, label in zip(subjects, labels):
+        subject_to_label.setdefault(subject, label)
+    rng = random.Random(train_cfg.random_seed)
+    hc_subjects = [s for s, lbl in subject_to_label.items() if lbl == 0]
+    mdd_subjects = [s for s, lbl in subject_to_label.items() if lbl == 1]
+    rng.shuffle(hc_subjects)
+    rng.shuffle(mdd_subjects)
+
+    def _split(bucket: List[str]) -> Tuple[List[str], List[str], List[str]]:
+        n_train = int(len(bucket) * train_cfg.train_ratio)
+        n_val = int(len(bucket) * train_cfg.val_ratio)
+        train = bucket[:n_train]
+        val = bucket[n_train : n_train + n_val]
+        test = bucket[n_train + n_val :]
+        return train, val, test
+
+    train_subjects, val_subjects, test_subjects = set(), set(), set()
+    for subset in (_split(hc_subjects), _split(mdd_subjects)):
+        train_subjects.update(subset[0])
+        val_subjects.update(subset[1])
+        test_subjects.update(subset[2])
+
+    def _collect(target_subjects: set) -> Dict[str, List]:
+        subset = {"paths": [], "labels": [], "subjects": []}
+        for path, label, subject in zip(file_paths, labels, subjects):
+            if subject in target_subjects:
+                subset["paths"].append(path)
+                subset["labels"].append(label)
+                subset["subjects"].append(subject)
+        return subset
+
+    train_data = _collect(train_subjects)
+    val_data = _collect(val_subjects)
+    test_data = _collect(test_subjects)
+    logger.info(
+        "Split summary | train: %d subjects (%d files) | val: %d subjects (%d files) | test: %d subjects (%d files)",
+        len(train_subjects),
+        len(train_data["paths"]),
+        len(val_subjects),
+        len(val_data["paths"]),
+        len(test_subjects),
+        len(test_data["paths"]),
+    )
+    return train_data, val_data, test_data
+
+
 
 def normalize_peak_amplitude(waveform: torch.Tensor) -> torch.Tensor:
     peak = waveform.abs().max()
@@ -281,7 +345,7 @@ def median_filter_1d(waveform: torch.Tensor, kernel: int) -> torch.Tensor:
     if kernel < 3 or kernel % 2 == 0:
         return waveform
     pad = kernel // 2
-    padded = torch.nn.functional.pad(waveform.unsqueeze(0), (pad, pad), mode="reflect").squeeze(0)
+    padded = F.pad(waveform.unsqueeze(0), (pad, pad), mode="reflect").squeeze(0)
     windows = padded.unfold(0, kernel, 1)
     return windows.median(dim=-1).values
 
@@ -323,8 +387,6 @@ def safe_audio_load(path: str) -> Tuple[torch.Tensor, int]:
         return waveform, sample_rate
 
 
-# Dataset
-
 _feature_extractor: Optional[Wav2Vec2FeatureExtractor] = None
 
 
@@ -344,18 +406,15 @@ class AudioDataset(Dataset):
         self,
         data: Dict[str, List],
         data_cfg: DataConfig,
-        model_cfg: ModelConfig,
         split: str,
     ) -> None:
         self.data_cfg = data_cfg
-        self.model_cfg = model_cfg
         self.split = split
         self.segment_length = data_cfg.sample_rate * data_cfg.segment_duration
         self.hop_length = max(1, int(self.segment_length * (1 - data_cfg.overlap_ratio)))
         self.apply_augmentation = data_cfg.apply_augmentation and split == "train"
         self.samples: List[Dict] = []
         subject_counts = Counter()
-        self.stft_window = torch.hann_window(400, periodic=True, dtype=torch.float32)
         for path, label, subject in tqdm(
             list(zip(data["paths"], data["labels"], data["subjects"])),
             desc=f"Indexing audio [{split}]",
@@ -388,6 +447,19 @@ class AudioDataset(Dataset):
         self.sample_weights = self._build_weights()
         self._cache_path: Optional[str] = None
         self._cache_waveform: Optional[torch.Tensor] = None
+        self.musan_paths = self._gather_audio_files(self.data_cfg.musan_dir)
+        self.dns_paths = self._gather_audio_files(self.data_cfg.dns_dir)
+        self.rir_paths = self._gather_audio_files(self.data_cfg.rir_dir)
+
+    def _gather_audio_files(self, directory: Optional[str]) -> List[str]:
+        if directory is None or not os.path.isdir(directory):
+            return []
+        paths: List[str] = []
+        for root, _, files in os.walk(directory):
+            for name in files:
+                if name.lower().endswith((".wav", ".flac", ".ogg")):
+                    paths.append(os.path.join(root, name))
+        return paths
 
     def _build_weights(self) -> torch.DoubleTensor:
         if not self.samples:
@@ -420,131 +492,140 @@ class AudioDataset(Dataset):
             self._cache_waveform = waveform.contiguous()
         return self._cache_waveform.clone()
 
-    def _crop_segment(self, waveform: torch.Tensor, offset: int) -> torch.Tensor:
-        target = self.segment_length
-        if waveform.size(0) <= target:
-            return torch.nn.functional.pad(waveform, (0, target - waveform.size(0)))
-        jitter = 0
-        if self.apply_augmentation:
-            half_hop = max(1, self.hop_length // 2)
-            jitter = random.randint(-half_hop, half_hop)
-        offset = int(min(max(offset + jitter, 0), waveform.size(0) - target))
-        return waveform[offset : offset + target]
+    def _select_random_audio(self, paths: List[str], target_len: int) -> Optional[torch.Tensor]:
+        if not paths:
+            return None
+        path = random.choice(paths)
+        waveform, sample_rate = safe_audio_load(path)
+        if waveform.size(0) > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        waveform = waveform.squeeze(0)
+        if sample_rate != self.data_cfg.sample_rate:
+            waveform = torchaudio.functional.resample(
+                waveform.unsqueeze(0),
+                sample_rate,
+                self.data_cfg.sample_rate,
+            ).squeeze(0)
+        if waveform.numel() < target_len:
+            repeats = max(1, math.ceil(target_len / max(waveform.numel(), 1)))
+            waveform = waveform.repeat(repeats)
+        start = random.randint(0, max(0, waveform.numel() - target_len))
+        return waveform[start : start + target_len]
 
-    def _time_stretch(self, segment: torch.Tensor) -> torch.Tensor:
-        rate = random.uniform(0.9, 1.1)
-        new_sr = max(1000, int(self.data_cfg.sample_rate * rate))
-        stretched = torchaudio.functional.resample(
-            segment.unsqueeze(0),
-            self.data_cfg.sample_rate,
-            new_sr,
-        ).squeeze(0)
-        if stretched.size(0) > segment.size(0):
-            start = random.randint(0, stretched.size(0) - segment.size(0))
-            stretched = stretched[start : start + segment.size(0)]
+    def _apply_musan_noise(self, segment: torch.Tensor) -> torch.Tensor:
+        noise = self._select_random_audio(self.musan_paths, segment.numel())
+        if noise is None:
+            return segment
+        snr_db = random.uniform(0.0, 15.0)
+        signal_power = segment.pow(2).mean().item() + 1e-9
+        noise_power = noise.pow(2).mean().item() + 1e-9
+        desired_noise_power = signal_power / (10 ** (snr_db / 10.0))
+        scale = math.sqrt(desired_noise_power / noise_power)
+        noisy = segment + noise * scale
+        return noisy.clamp(-1.0, 1.0)
+
+    def _apply_dns_noise(self, segment: torch.Tensor) -> torch.Tensor:
+        noise = self._select_random_audio(self.dns_paths, segment.numel())
+        if noise is None:
+            return segment
+        snr_db = random.uniform(5.0, 20.0)
+        signal_power = segment.pow(2).mean().item() + 1e-9
+        noise_power = noise.pow(2).mean().item() + 1e-9
+        desired_noise_power = signal_power / (10 ** (snr_db / 10.0))
+        scale = math.sqrt(desired_noise_power / noise_power)
+        noisy = segment + noise * scale
+        return noisy.clamp(-1.0, 1.0)
+
+    def _apply_rir(self, segment: torch.Tensor) -> torch.Tensor:
+        rir = self._select_random_audio(self.rir_paths, self.data_cfg.sample_rate)
+        if rir is None:
+            return segment
+        rir = rir / (rir.norm(p=2) + 1e-9)
+        rir = rir.flip(0)
+        augmented = F.conv1d(
+            segment.unsqueeze(0).unsqueeze(0),
+            rir.unsqueeze(0).unsqueeze(0),
+        ).squeeze(0).squeeze(0)
+        if augmented.numel() < segment.numel():
+            augmented = F.pad(augmented, (0, segment.numel() - augmented.numel()))
         else:
-            stretched = torch.nn.functional.pad(stretched, (0, segment.size(0) - stretched.size(0)))
-        return stretched
-
-    def _random_eq(self, segment: torch.Tensor) -> torch.Tensor:
-        gain_db = random.uniform(-3.0, 3.0)
-        center_freq = random.uniform(200.0, 3500.0)
-        q = random.uniform(0.5, 1.5)
-        eq = torchaudio.functional.equalizer_biquad(
-            segment.unsqueeze(0),
-            self.data_cfg.sample_rate,
-            center_freq,
-            gain_db,
-            Q=q,
-        )
-        return eq.squeeze(0)
-
-    def _bandpass_noise(self, segment: torch.Tensor) -> torch.Tensor:
-        noise = torch.randn_like(segment)
-        low_freq = random.uniform(100.0, 1000.0)
-        high_freq = random.uniform(1500.0, 6000.0)
-        if high_freq <= low_freq:
-            high_freq = low_freq + 500.0
-        nyquist = self.data_cfg.sample_rate / 2.0
-        high_freq = min(high_freq, nyquist - 100.0)
-        low_freq = max(50.0, min(low_freq, high_freq - 100.0))
-        center_freq = (low_freq + high_freq) / 2.0
-        bandwidth = max(high_freq - low_freq, 100.0)
-        q_factor = max(center_freq / bandwidth, 0.1)
-        filtered = torchaudio.functional.bandpass_biquad(
-            noise.unsqueeze(0),
-            self.data_cfg.sample_rate,
-            center_freq,
-            q_factor,
-        ).squeeze(0)
-        noise_level = random.uniform(0.001, 0.01)
-        return segment + filtered * noise_level
-
-    def _specaugment(self, segment: torch.Tensor) -> torch.Tensor:
-        n_fft = 400
-        hop = 160
-        win = 400
-        window = self.stft_window.to(segment.device)
-        spec = torch.stft(
-            segment,
-            n_fft=n_fft,
-            hop_length=hop,
-            win_length=win,
-            window=window,
-            return_complex=True,
-        )
-        spec = spec.clone()
-        if spec.size(1) > 0:
-            t_mask = random.randint(0, max(0, spec.size(1) // 6))
-            t_start = random.randint(0, max(0, spec.size(1) - t_mask)) if t_mask > 0 else 0
-            if t_mask > 0:
-                spec[:, t_start : t_start + t_mask] = 0
-        if spec.size(0) > 0:
-            f_mask = random.randint(0, max(0, spec.size(0) // 8))
-            f_start = random.randint(0, max(0, spec.size(0) - f_mask)) if f_mask > 0 else 0
-            if f_mask > 0:
-                spec[f_start : f_start + f_mask, :] = 0
-        augmented = torch.istft(
-            spec,
-            n_fft=n_fft,
-            hop_length=hop,
-            win_length=win,
-            window=window,
-            length=segment.size(0),
-        )
-        return augmented
+            augmented = augmented[: segment.numel()]
+        return augmented.clamp(-1.0, 1.0)
 
     def _augment(self, segment: torch.Tensor) -> torch.Tensor:
-        if random.random() < 0.5:
-            segment = self._time_stretch(segment)
-        if random.random() < 0.7:
-            segment = self._random_eq(segment)
-        if random.random() < 0.5:
-            segment = self._bandpass_noise(segment)
-        if random.random() < 0.5:
-            segment = self._specaugment(segment)
-        gain = random.uniform(0.85, 1.15)
-        segment = segment * gain
-        segment = segment.clamp(-1.0, 1.0)
-        return segment
+        if not self.apply_augmentation or random.random() >= self.data_cfg.augmentation_prob:
+            return segment
+        augmentation_choices = [
+            (self._apply_musan_noise, bool(self.musan_paths)),
+            (self._apply_dns_noise, bool(self.dns_paths)),
+            (self._apply_rir, bool(self.rir_paths)),
+        ]
+        valid = [fn for fn, available in augmentation_choices if available]
+        if not valid:
+            return segment
+        fn = random.choice(valid)
+        return fn(segment)
 
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, int, str]:
+    def _crop_segment(self, waveform: torch.Tensor, offset: int) -> Tuple[torch.Tensor, int]:
+        target = self.segment_length
+        if waveform.size(0) <= target:
+            length = waveform.size(0)
+            padded = F.pad(waveform, (0, target - waveform.size(0)))
+            return padded, length
+        offset = int(min(max(offset, 0), waveform.size(0) - target))
+        segment = waveform[offset : offset + target]
+        return segment, target
+
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, int, str, int]:
         sample = self.samples[index]
         waveform = self._load_waveform(sample["path"])
-        segment = self._crop_segment(waveform, sample["offset"]).float()
+        segment, length = self._crop_segment(waveform, sample["offset"])
         if self.apply_augmentation:
             segment = self._augment(segment)
-        return segment, sample["label"], sample["subject"]
+        return segment.float(), sample["label"], sample["subject"], length
+
+
+
+def _compute_fbank(segment: torch.Tensor, data_cfg: DataConfig) -> torch.Tensor:
+    waveform = segment.unsqueeze(0)
+    features = torchaudio.compliance.kaldi.fbank(
+        waveform,
+        sample_frequency=data_cfg.sample_rate,
+        num_mel_bins=data_cfg.fbank_num_mel,
+        frame_length=data_cfg.fbank_frame_length_ms,
+        frame_shift=data_cfg.fbank_frame_shift_ms,
+        use_energy=False,
+        dither=0.0,
+    )
+    return features
 
 
 def collate_fn(
-    batch: List[Tuple[torch.Tensor, int, str]],
-    model_cfg: ModelConfig,
+    batch: List[Tuple[torch.Tensor, int, str, int]],
     data_cfg: DataConfig,
+    model_cfg: ModelConfig,
 ):
-    segments, labels, subjects = zip(*batch)
+    segments, labels, subjects, lengths = zip(*batch)
+    segments = [seg.clone() for seg in segments]
+    lengths_tensor = torch.tensor(lengths, dtype=torch.long)
+    label_tensor = torch.tensor(labels, dtype=torch.long)
+    if data_cfg.feature_type.lower() == "fbank":
+        features: List[torch.Tensor] = []
+        frame_lengths: List[int] = []
+        for segment, length in zip(segments, lengths_tensor.tolist()):
+            trimmed = segment[:length]
+            fb = _compute_fbank(trimmed, data_cfg)
+            features.append(fb)
+            frame_lengths.append(fb.size(0))
+        padded = nn.utils.rnn.pad_sequence(features, batch_first=True)
+        length_tensor = torch.tensor(frame_lengths, dtype=torch.long)
+        return (
+            {"features": padded, "feature_lengths": length_tensor},
+            label_tensor,
+            list(subjects),
+        )
     extractor = get_feature_extractor(model_cfg)
-    segments_np = [seg.cpu().numpy() for seg in segments]
+    segments_np = [seg.numpy() for seg in segments]
     processed = extractor(
         segments_np,
         sampling_rate=data_cfg.sample_rate,
@@ -552,136 +633,311 @@ def collate_fn(
         return_tensors="pt",
     )
     return (
-        processed.input_values,
-        processed.attention_mask.long(),
-        torch.tensor(labels, dtype=torch.long),
+        {
+            "input_values": processed.input_values,
+            "attention_mask": processed.attention_mask.long(),
+            "sample_lengths": lengths_tensor,
+        },
+        label_tensor,
         list(subjects),
     )
 
 
-# Model definition
+def lengths_to_mask(lengths: torch.Tensor, max_length: int) -> torch.Tensor:
+    range_tensor = torch.arange(max_length, device=lengths.device).unsqueeze(0)
+    return range_tensor < lengths.unsqueeze(1)
+
+
+class Conv1dReluBn(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, dilation: int = 1) -> None:
+        super().__init__()
+        padding = dilation * (kernel_size - 1) // 2
+        self.conv = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            padding=padding,
+            dilation=dilation,
+        )
+        self.bn = nn.BatchNorm1d(out_channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.bn(F.relu(self.conv(x)))
+
+
+class Res2Conv1dReluBn(nn.Module):
+    def __init__(self, channels: int, kernel_size: int, scale: int = 8, dilation: int = 1) -> None:
+        super().__init__()
+        if scale < 1:
+            raise ValueError("scale must be >= 1")
+        if scale > 1 and channels % scale != 0:
+            raise ValueError("channels must be divisible by scale when scale > 1")
+        self.scale = scale
+        self.width = channels // scale if scale > 1 else channels
+        self.nums = scale
+        padding = dilation * (kernel_size - 1) // 2
+        self.convs = nn.ModuleList(
+            [
+                nn.Conv1d(
+                    self.width,
+                    self.width,
+                    kernel_size,
+                    padding=padding,
+                    dilation=dilation,
+                )
+                for _ in range(self.nums - 1)
+            ]
+        )
+        self.bns = nn.ModuleList([nn.BatchNorm1d(self.width) for _ in range(self.nums - 1)])
+        self.relu = nn.ReLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.scale == 1:
+            if not self.convs:
+                return x
+            out = self.convs[0](x)
+            out = self.relu(out)
+            return self.bns[0](out)
+        splits = torch.split(x, self.width, dim=1)
+        outputs = []
+        for i in range(self.nums):
+            if i == 0:
+                outputs.append(splits[i])
+            else:
+                temp = splits[i] + outputs[i - 1]
+                temp = self.convs[i - 1](temp)
+                temp = self.relu(temp)
+                temp = self.bns[i - 1](temp)
+                outputs.append(temp)
+        return torch.cat(outputs, dim=1)
+
+
+class SEBlock(nn.Module):
+    def __init__(self, channels: int, bottleneck: int = 128) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv1d(channels, bottleneck, kernel_size=1)
+        self.conv2 = nn.Conv1d(bottleneck, channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        pooled = x.mean(dim=2, keepdim=True)
+        excitation = torch.sigmoid(self.conv2(F.relu(self.conv1(pooled))))
+        return x * excitation
+
+
+class SERes2Block(nn.Module):
+    def __init__(self, channels: int, kernel_size: int, scale: int, dilation: int) -> None:
+        super().__init__()
+        self.res2 = Res2Conv1dReluBn(channels, kernel_size, scale=scale, dilation=dilation)
+        self.conv1x1 = nn.Conv1d(channels, channels, kernel_size=1)
+        self.bn = nn.BatchNorm1d(channels)
+        self.se = SEBlock(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        out = self.res2(x)
+        out = self.conv1x1(out)
+        out = self.bn(out)
+        out = self.se(out)
+        return out + residual
 
 
 class AttentiveStatisticsPooling(nn.Module):
-    def __init__(self, input_dim: int) -> None:
+    def __init__(self, input_dim: int, attention_channels: int = 128) -> None:
         super().__init__()
         self.attention = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.Tanh(),
-            nn.Linear(128, 1),
+            nn.Conv1d(input_dim, attention_channels, kernel_size=1),
+            nn.ReLU(),
+            nn.BatchNorm1d(attention_channels),
+            nn.Conv1d(attention_channels, input_dim, kernel_size=1),
         )
 
-    def forward(self, hidden_states: torch.Tensor, padding_mask: torch.Tensor) -> torch.Tensor:
-        float_mask = padding_mask.unsqueeze(-1).type_as(hidden_states)
-        attn_logits = self.attention(hidden_states).masked_fill(
-            padding_mask.unsqueeze(-1) == 0,
-            float("-inf"),
-        )
-        attn_weights = torch.softmax(attn_logits, dim=1)
-        mean = torch.sum(hidden_states * attn_weights * float_mask, dim=1)
-        variance = torch.sum(
-            ((hidden_states - mean.unsqueeze(1)) ** 2) * attn_weights * float_mask,
-            dim=1,
-        )
-        std = torch.sqrt(torch.clamp(variance, min=1e-8))
-        return torch.cat([mean, std], dim=-1)
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        max_len = x.size(2)
+        mask = lengths_to_mask(lengths, max_len).unsqueeze(1)
+        attn_logits = self.attention(x).masked_fill(mask == 0, float("-inf"))
+        attn = torch.softmax(attn_logits, dim=2) * mask
+        attn = attn / (attn.sum(dim=2, keepdim=True) + 1e-9)
+        mean = torch.sum(x * attn, dim=2)
+        var = torch.sum(((x - mean.unsqueeze(-1)) ** 2) * attn, dim=2)
+        std = torch.sqrt(torch.clamp(var, min=1e-9))
+        return torch.cat([mean, std], dim=1)
 
 
-class DepressionClassifier(nn.Module):
-    def __init__(self, model_cfg: ModelConfig) -> None:
+class ECAPA_TDNN_Small(nn.Module):
+    def __init__(self, input_dim: int, channels: int, embedding_dim: int) -> None:
         super().__init__()
+        self.layer1 = Conv1dReluBn(input_dim, channels, kernel_size=5)
+        self.layer2 = SERes2Block(channels, kernel_size=3, scale=8, dilation=2)
+        self.layer3 = SERes2Block(channels, kernel_size=3, scale=8, dilation=3)
+        self.layer4 = SERes2Block(channels, kernel_size=3, scale=8, dilation=4)
+        self.layer5 = Conv1dReluBn(channels * 3, channels, kernel_size=1)
+        self.pooling = AttentiveStatisticsPooling(channels)
+        self.fc = nn.Linear(channels * 2, embedding_dim)
+        self.bn = nn.BatchNorm1d(embedding_dim, affine=False)
+
+    def forward(self, features: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        x = features.transpose(1, 2)
+        x1 = self.layer1(x)
+        x2 = self.layer2(x1)
+        x3 = self.layer3(x2)
+        x4 = self.layer4(x3)
+        concat = torch.cat([x2, x3, x4], dim=1)
+        context = self.layer5(concat)
+        stats = self.pooling(context, lengths)
+        embedding = self.fc(stats)
+        embedding = self.bn(embedding)
+        return F.normalize(embedding, p=2, dim=1)
+
+
+class AAMSoftmaxHead(nn.Module):
+    def __init__(self, embedding_dim: int, num_classes: int, margin: float, scale: float) -> None:
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.num_classes = num_classes
+        self.margin = margin
+        self.scale = scale
+        self.weight = nn.Parameter(torch.randn(num_classes, embedding_dim))
+        nn.init.xavier_uniform_(self.weight)
+        self.cos_m = math.cos(margin)
+        self.sin_m = math.sin(margin)
+        self.th = math.cos(math.pi - margin)
+        self.mm = math.sin(math.pi - margin) * margin
+
+    def forward(self, embeddings: torch.Tensor, labels: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        normalized_embeddings = F.normalize(embeddings)
+        normalized_weights = F.normalize(self.weight)
+        cosine = F.linear(normalized_embeddings, normalized_weights)
+        cosine = torch.clamp(cosine, -1.0 + 1e-7, 1.0 - 1e-7)
+        if labels is None:
+            return self.scale * cosine, cosine, None
+        sine = torch.sqrt(torch.clamp(1.0 - cosine ** 2, min=1e-9))
+        phi = cosine * self.cos_m - sine * self.sin_m
+        phi = torch.where(cosine > self.th, phi, cosine - self.mm)
+        one_hot = torch.zeros_like(cosine)
+        one_hot.scatter_(1, labels.view(-1, 1), 1.0)
+        logits = cosine * (1.0 - one_hot) + phi * one_hot
+        logits = logits * self.scale
+        target_cosine = cosine.gather(1, labels.view(-1, 1)).squeeze(1)
+        return logits, cosine, target_cosine
+
+
+class SpeakerVerificationModel(nn.Module):
+    def __init__(self, data_cfg: DataConfig, model_cfg: ModelConfig, num_classes: int) -> None:
+        super().__init__()
+        self.data_cfg = data_cfg
         self.model_cfg = model_cfg
-        self.wavlm = WavLMModel.from_pretrained(
-            model_cfg.model_name,
-            local_files_only=model_cfg.local_files_only,
-            cache_dir=model_cfg.hf_cache_dir,
-        )
-        self.wavlm.eval()
+        self.feature_type = data_cfg.feature_type.lower()
+        self.num_classes = num_classes
+        self.wavlm: Optional[WavLMModel] = None
+        self.layer_weights: Optional[nn.Parameter] = None
+        if self.feature_type == "pretrained":
+            self.wavlm = WavLMModel.from_pretrained(
+                model_cfg.model_name,
+                local_files_only=model_cfg.local_files_only,
+                cache_dir=model_cfg.hf_cache_dir,
+            )
+            if model_cfg.use_layer_weighting:
+                n_hidden = getattr(self.wavlm.config, "num_hidden_layers", len(self.wavlm.encoder.layers))
+                self.layer_weights = nn.Parameter(torch.ones(n_hidden + 1))
+        input_dim = model_cfg.hidden_dim if self.feature_type == "pretrained" else data_cfg.fbank_num_mel
+        self.ecapa = ECAPA_TDNN_Small(input_dim, model_cfg.ecapa_channels, model_cfg.embedding_dim)
+        self.classifier = AAMSoftmaxHead(model_cfg.embedding_dim, num_classes, margin=CONFIG.train.aam_margin, scale=CONFIG.train.aam_scale)
+        self.set_backbone_trainable(False)
+
+    def set_backbone_trainable(self, trainable: bool) -> None:
+        if self.wavlm is None:
+            return
         for param in self.wavlm.parameters():
             param.requires_grad = False
-        if model_cfg.unfreeze_last_n_layers > 0:
-            self._unfreeze_last_layers(model_cfg.unfreeze_last_n_layers)
-        self.wavlm_trainable = any(param.requires_grad for param in self.wavlm.parameters())
-
-        self.use_layer_weighting = model_cfg.use_layer_weighting
-        self.layer_weights: Optional[nn.Parameter] = None
-        if self.use_layer_weighting:
-            n_hidden = getattr(
-                self.wavlm.config,
-                "num_hidden_layers",
-                len(self.wavlm.encoder.layers),
-            )
-            self.layer_weights = nn.Parameter(torch.ones(n_hidden + 1))
-
-        if self.wavlm_trainable and self.use_layer_weighting:
-            logger.warning(
-                "Disabling layer weighting because WavLM layers are unfrozen; "
-                "requesting all hidden states with gradients greatly increases memory usage."
-            )
-            self.use_layer_weighting = False
-            self.layer_weights = None
-
-        self.pooling = AttentiveStatisticsPooling(model_cfg.hidden_dim)
-        self.classifier = nn.Sequential(
-            nn.Linear(model_cfg.hidden_dim * 2, 256),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(256, 2),
-        )
-        self._trainable = [p for p in self.parameters() if p.requires_grad]
-
-    def _unfreeze_last_layers(self, n_layers: int) -> None:
-        encoder_layers = self.wavlm.encoder.layers
-        for layer in encoder_layers[-n_layers:]:
-            for param in layer.parameters():
+        self.wavlm.eval()
+        if not trainable:
+            return
+        encoder_layers = getattr(self.wavlm, "encoder", None)
+        layers = getattr(encoder_layers, "layers", None)
+        if layers is None:
+            for param in self.wavlm.parameters():
                 param.requires_grad = True
-        self.wavlm.layerdrop = 0.0
-        if hasattr(self.wavlm, "gradient_checkpointing_enable"):
-            self.wavlm.gradient_checkpointing_enable()
-
-    @property
-    def trainable_parameters(self) -> List[nn.Parameter]:
-        return self._trainable
-
-    def forward(self, input_values: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        wavlm_kwargs = {"output_hidden_states": self.use_layer_weighting}
-        if self.wavlm_trainable:
-            outputs = self.wavlm(input_values, attention_mask=attention_mask, **wavlm_kwargs)
         else:
-            with torch.no_grad():
-                outputs = self.wavlm(input_values, attention_mask=attention_mask, **wavlm_kwargs)
+            n_layers = len(layers)
+            target = self.model_cfg.unfreeze_last_n_layers
+            if target <= 0 or target > n_layers:
+                target = n_layers
+            for layer in layers[-target:]:
+                for param in layer.parameters():
+                    param.requires_grad = True
+        if hasattr(self.wavlm, "layer_norm"):
+            for param in self.wavlm.layer_norm.parameters():
+                param.requires_grad = True
+        self.wavlm.train()
 
-        if self.use_layer_weighting and outputs.hidden_states is not None and self.layer_weights is not None:
-            hidden_stack = torch.stack(outputs.hidden_states, dim=0)
-            if hidden_stack.size(0) != self.layer_weights.numel():
-                hidden_stack = hidden_stack[-self.layer_weights.numel() :]
-            weights = torch.softmax(self.layer_weights, dim=0)
-            hidden_states = torch.einsum("l,lbsd->bsd", weights, hidden_stack)
+    def head_parameters(self) -> List[nn.Parameter]:
+        params: List[nn.Parameter] = list(self.ecapa.parameters()) + [self.classifier.weight]
+        if self.layer_weights is not None:
+            params.append(self.layer_weights)
+        return [p for p in params if p.requires_grad]
+
+    def backbone_parameters(self) -> List[nn.Parameter]:
+        if self.wavlm is None:
+            return []
+        return [p for p in self.wavlm.parameters() if p.requires_grad]
+
+    def forward(self, batch: Dict[str, torch.Tensor], labels: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        if self.feature_type == "pretrained":
+            if self.wavlm is None:
+                raise RuntimeError("WavLM backbone is not initialized.")
+            wavlm_kwargs = {"output_hidden_states": self.layer_weights is not None}
+            outputs = self.wavlm(
+                batch["input_values"],
+                attention_mask=batch.get("attention_mask"),
+                **wavlm_kwargs,
+            )
+            if self.layer_weights is not None and outputs.hidden_states is not None:
+                hidden_stack = torch.stack(outputs.hidden_states, dim=0)
+                if hidden_stack.size(0) != self.layer_weights.numel():
+                    hidden_stack = hidden_stack[-self.layer_weights.numel() :]
+                weights = torch.softmax(self.layer_weights, dim=0)
+                features = torch.einsum("l,lbsd->bsd", weights, hidden_stack)
+            else:
+                features = outputs.last_hidden_state
+            input_lengths = batch["attention_mask"].sum(dim=1)
+            if hasattr(self.wavlm, "_get_feat_extract_output_lengths"):
+                lengths = self.wavlm._get_feat_extract_output_lengths(input_lengths).to(features.device)
+            else:
+                stride = int(np.prod(self.wavlm.config.conv_stride))
+                lengths = torch.div(input_lengths + stride - 1, stride, rounding_mode="floor").to(features.device)
         else:
-            hidden_states = outputs.last_hidden_state
-        input_lengths = attention_mask.sum(dim=-1)
-        if hasattr(self.wavlm, "_get_feat_extract_output_lengths"):
-            feat_lengths = self.wavlm._get_feat_extract_output_lengths(input_lengths).to(hidden_states.device)
-        else:
-            stride = int(np.prod(self.wavlm.config.conv_stride))
-            feat_lengths = torch.div(
-                input_lengths + stride - 1,
-                stride,
-                rounding_mode="floor",
-            ).to(hidden_states.device)
-        max_len = hidden_states.size(1)
-        frame_index = torch.arange(max_len, device=hidden_states.device).unsqueeze(0)
-        padding_mask = frame_index < feat_lengths.unsqueeze(1)
-        embeddings = self.pooling(hidden_states, padding_mask)
-        return self.classifier(embeddings)
+            features = batch["features"].to(self.classifier.weight.device)
+            lengths = batch["feature_lengths"].to(features.device)
+        embeddings = self.ecapa(features, lengths)
+        logits, cosine, target_cosine = self.classifier(embeddings, labels)
+        return logits, cosine, target_cosine, embeddings
 
 
-# Training / evaluation
+
+def compute_inter_topk_penalty(
+    cosine: torch.Tensor,
+    target_cosine: torch.Tensor,
+    labels: torch.Tensor,
+    topk: int,
+    margin: float,
+) -> torch.Tensor:
+    if topk <= 0 or cosine.size(1) <= 1:
+        return torch.tensor(0.0, device=cosine.device, dtype=cosine.dtype)
+    masked = cosine.clone()
+    masked.scatter_(1, labels.view(-1, 1), float("-inf"))
+    k = min(topk, cosine.size(1) - 1)
+    topk_vals, _ = torch.topk(masked, k=k, dim=1)
+    penalty = F.relu(topk_vals + margin - target_cosine.unsqueeze(1))
+    return penalty.sum(dim=1).mean()
+
+
+def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
+    return {key: tensor.to(device) if torch.is_tensor(tensor) else tensor for key, tensor in batch.items()}
+
 
 def train_one_epoch(
-    model: DepressionClassifier,
+    model: SpeakerVerificationModel,
     dataloader: DataLoader,
-    criterion: nn.Module,
     optimizer: optim.Optimizer,
     scaler: GradScaler,
     device: torch.device,
@@ -697,14 +953,22 @@ def train_one_epoch(
     lr_scaled = False
 
     progress = tqdm(dataloader, desc="Training", leave=False, dynamic_ncols=True)
-    for input_values, attention_mask, labels, _ in progress:
-        input_values = input_values.to(device)
-        attention_mask = attention_mask.to(device)
+    for batch_data, labels, _ in progress:
         labels = labels.to(device)
+        batch_data = move_batch_to_device(batch_data, device)
         optimizer.zero_grad()
         with autocast(enabled=amp_enabled):
-            logits = model(input_values, attention_mask)
-            loss = criterion(logits, labels)
+            logits, cosine, target_cosine, _ = model(batch_data, labels)
+            loss = F.cross_entropy(logits, labels)
+            if target_cosine is not None:
+                penalty = compute_inter_topk_penalty(
+                    cosine,
+                    target_cosine,
+                    labels,
+                    train_cfg.inter_topk,
+                    train_cfg.inter_margin,
+                )
+                loss = loss + penalty
         if not torch.isfinite(loss):
             nan_warnings += 1
             if nan_warnings <= train_cfg.max_nan_warnings:
@@ -715,7 +979,6 @@ def train_one_epoch(
                     nan_warnings,
                 )
                 suppression_logged = True
-
             optimizer.zero_grad(set_to_none=True)
             if train_cfg.nan_lr_scale < 1.0:
                 for group in optimizer.param_groups:
@@ -732,7 +995,7 @@ def train_one_epoch(
         scaler.scale(loss).backward()
         if train_cfg.max_grad_norm is not None:
             scaler.unscale_(optimizer)
-            clip_grad_norm_(model.trainable_parameters, train_cfg.max_grad_norm)
+            clip_grad_norm_(model.parameters(), train_cfg.max_grad_norm)
         scaler.step(optimizer)
         scaler.update()
         preds = logits.argmax(dim=1)
@@ -749,7 +1012,7 @@ def train_one_epoch(
 
 
 def evaluate(
-    model: DepressionClassifier,
+    model: SpeakerVerificationModel,
     dataloader: DataLoader,
     device: torch.device,
     use_amp: bool,
@@ -764,19 +1027,13 @@ def evaluate(
     all_logits: List[List[float]] = []
 
     with torch.no_grad():
-        for input_values, attention_mask, labels, subjects in tqdm(
-            dataloader,
-            desc=f"Evaluating[{split_name}]",
-            leave=False,
-        ):
-            input_values = input_values.to(device)
-            attention_mask = attention_mask.to(device)
+        for batch_data, labels, subjects in tqdm(dataloader, desc=f"Evaluating[{split_name}]", leave=False):
             labels = labels.to(device)
+            batch_data = move_batch_to_device(batch_data, device)
             with autocast(enabled=use_amp):
-                logits = model(input_values, attention_mask)
+                logits, _, _, _ = model(batch_data, labels)
                 probs = torch.softmax(logits, dim=1)
             preds = probs.argmax(dim=1)
-
             all_preds.extend(preds.cpu().tolist())
             all_labels.extend(labels.cpu().tolist())
             all_probs.extend(probs[:, 1].cpu().tolist())
@@ -814,13 +1071,11 @@ def evaluate(
 
     subject_preds: List[int] = []
     subject_labels: List[int] = []
-    subject_prob_values: List[float] = []
     for subject, logits_list in subject_logits.items():
         logits_tensor = torch.tensor(logits_list, dtype=torch.float32)
         mean_logits = logits_tensor.mean(dim=0)
         mean_probs = torch.softmax(mean_logits, dim=0)
         subject_preds.append(int(torch.argmax(mean_probs).item()))
-        subject_prob_values.append(float(mean_probs[1].item()))
         subject_labels.append(subject_true[subject])
 
     if subject_labels:
@@ -899,7 +1154,35 @@ def write_epoch_history(records: List[Dict], filepath: str) -> None:
     df.to_csv(filepath, mode="a", header=write_header, index=False)
 
 
-# Main experiment workflow
+
+def determine_total_epochs(train_cfg: TrainConfig, feature_type: str) -> int:
+    if feature_type.lower() == "fbank":
+        return train_cfg.fbank_epochs
+    return train_cfg.pretrained_freeze_epochs + train_cfg.pretrained_finetune_epochs
+
+
+def build_dataloader(
+    dataset: AudioDataset,
+    data_cfg: DataConfig,
+    model_cfg: ModelConfig,
+    train_cfg: TrainConfig,
+    sampler: Optional[WeightedRandomSampler],
+    shuffle: bool,
+) -> DataLoader:
+    def _collate(batch):
+        return collate_fn(batch, data_cfg, model_cfg)
+
+    return DataLoader(
+        dataset,
+        batch_size=train_cfg.batch_size,
+        sampler=sampler,
+        shuffle=shuffle if sampler is None else False,
+        num_workers=train_cfg.num_workers,
+        pin_memory=torch.cuda.is_available(),
+        collate_fn=_collate,
+        persistent_workers=train_cfg.persistent_workers and train_cfg.num_workers > 0,
+    )
+
 
 def main() -> None:
     setup_logging()
@@ -912,10 +1195,9 @@ def main() -> None:
     seed_everything(CONFIG.train.random_seed)
     file_paths, labels, subjects = load_metadata(CONFIG.data)
     train_data, val_data, test_data = split_by_subject(file_paths, labels, subjects, CONFIG.train)
-    get_feature_extractor(CONFIG.model)
-    train_dataset = AudioDataset(train_data, CONFIG.data, CONFIG.model, split="train")
-    val_dataset = AudioDataset(val_data, CONFIG.data, CONFIG.model, split="val")
-    test_dataset = AudioDataset(test_data, CONFIG.data, CONFIG.model, split="test")
+    train_dataset = AudioDataset(train_data, CONFIG.data, split="train")
+    val_dataset = AudioDataset(val_data, CONFIG.data, split="val")
+    test_dataset = AudioDataset(test_data, CONFIG.data, split="test")
     if not len(train_dataset):
         raise RuntimeError("Training dataset is empty.")
     sampler = None
@@ -925,58 +1207,23 @@ def main() -> None:
             num_samples=len(train_dataset),
             replacement=True,
         )
+    train_loader = build_dataloader(train_dataset, CONFIG.data, CONFIG.model, CONFIG.train, sampler, shuffle=True)
+    val_loader = build_dataloader(val_dataset, CONFIG.data, CONFIG.model, CONFIG.train, sampler=None, shuffle=False)
+    test_loader = build_dataloader(test_dataset, CONFIG.data, CONFIG.model, CONFIG.train, sampler=None, shuffle=False)
 
-    def _collate(batch):
-        return collate_fn(batch, CONFIG.model, CONFIG.data)
-
-    common_loader_kwargs = dict(
-        num_workers=CONFIG.train.num_workers,
-        pin_memory=torch.cuda.is_available(),
-        collate_fn=_collate,
-        persistent_workers=CONFIG.train.persistent_workers and CONFIG.train.num_workers > 0,
+    num_classes = len(train_dataset.class_counts) if train_dataset.class_counts else len(set(labels))
+    model = SpeakerVerificationModel(CONFIG.data, CONFIG.model, num_classes).to(CONFIG.device)
+    head_params = model.head_parameters()
+    optimizer = optim.AdamW(
+        [
+            {"params": head_params, "lr": CONFIG.train.head_learning_rate},
+        ],
+        weight_decay=CONFIG.train.weight_decay,
     )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=CONFIG.train.batch_size,
-        sampler=sampler,
-        shuffle=sampler is None,
-        **common_loader_kwargs,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=CONFIG.train.batch_size,
-        shuffle=False,
-        **common_loader_kwargs,
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=CONFIG.train.batch_size,
-        shuffle=False,
-        **common_loader_kwargs,
-    )
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    epoch_history: List[Dict] = []
-    model = DepressionClassifier(CONFIG.model).to(CONFIG.device)
-    if not model.trainable_parameters:
-        raise RuntimeError("No trainable parameters detected. Adjust unfreeze settings.")
-    criterion = nn.CrossEntropyLoss()
-    head_params = [
-        p
-        for p in list(model.classifier.parameters()) + list(model.pooling.parameters())
-        if p.requires_grad
-    ]
-    if model.use_layer_weighting and model.layer_weights is not None and model.layer_weights.requires_grad:
-        head_params.append(model.layer_weights)
-    backbone_params = [p for p in model.wavlm.parameters() if p.requires_grad]
-    optimizer_groups = []
-    if head_params:
-        optimizer_groups.append({"params": head_params, "lr": CONFIG.train.head_learning_rate})
-    if backbone_params:
-        optimizer_groups.append({"params": backbone_params, "lr": CONFIG.train.backbone_learning_rate})
-    optimizer = optim.AdamW(optimizer_groups, weight_decay=CONFIG.train.weight_decay)
+    total_epochs = determine_total_epochs(CONFIG.train, CONFIG.data.feature_type)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        T_max=CONFIG.train.num_epochs,
+        T_max=total_epochs,
         eta_min=CONFIG.train.scheduler_eta_min,
     )
     scaler = GradScaler(enabled=CONFIG.train.use_amp and CONFIG.device.type == "cuda")
@@ -986,6 +1233,10 @@ def main() -> None:
     metric_field = "segment_acc" if val_metric_key == "segment" else "subject_acc"
     best_val_score = float("-inf")
     baseline_log_path = os.path.join(CONFIG.train.log_dir, "epoch_metrics.csv")
+
+    if CONFIG.data.feature_type.lower() == "pretrained":
+        model.set_backbone_trainable(False)
+
     if CONFIG.train.resume_from_best and os.path.exists(CONFIG.train.best_model_path):
         state_dict = torch.load(CONFIG.train.best_model_path, map_location=CONFIG.device)
         model.load_state_dict(state_dict)
@@ -1005,7 +1256,7 @@ def main() -> None:
             best_val_score,
         )
         baseline_record = {
-            "run_id": run_id,
+            "run_id": datetime.now().strftime("%Y%m%d_%H%M%S"),
             "phase": "baseline",
             "epoch": 0,
             "train_loss": None,
@@ -1015,20 +1266,34 @@ def main() -> None:
             "val_f1": baseline.get("f1"),
             "val_auc": baseline.get("auc"),
             "lr_head": optimizer.param_groups[0]["lr"],
-            "lr_backbone": optimizer.param_groups[1]["lr"] if len(optimizer.param_groups) > 1 else None,
+            "lr_backbone": None,
             "best_metric": best_val_score,
             "timestamp": datetime.now().isoformat(),
         }
-        epoch_history.append(baseline_record)
         write_epoch_history([baseline_record], baseline_log_path)
+
     train_losses: List[float] = []
     val_metrics: List[Dict[str, float]] = []
-    for epoch in range(1, CONFIG.train.num_epochs + 1):
-        logger.info("Epoch %d/%d", epoch, CONFIG.train.num_epochs)
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backbone_params_added = False
+
+    for epoch in range(1, total_epochs + 1):
+        logger.info("Epoch %d/%d", epoch, total_epochs)
+        if (
+            CONFIG.data.feature_type.lower() == "pretrained"
+            and not backbone_params_added
+            and epoch > CONFIG.train.pretrained_freeze_epochs
+        ):
+            model.set_backbone_trainable(True)
+            backbone_params = model.backbone_parameters()
+            if backbone_params:
+                optimizer.add_param_group({"params": backbone_params, "lr": CONFIG.train.backbone_learning_rate})
+                scheduler.base_lrs.append(CONFIG.train.backbone_learning_rate)
+                backbone_params_added = True
+
         train_loss, train_acc = train_one_epoch(
             model,
             train_loader,
-            criterion,
             optimizer,
             scaler,
             CONFIG.device,
@@ -1036,6 +1301,7 @@ def main() -> None:
         )
         train_losses.append(train_loss)
         logger.info("Train | loss=%.4f | acc=%.4f", train_loss, train_acc)
+
         val_result = evaluate(
             model,
             val_loader,
@@ -1065,7 +1331,9 @@ def main() -> None:
             )
         scheduler.step()
         lr_head = optimizer.param_groups[0]["lr"]
-        lr_backbone = optimizer.param_groups[1]["lr"] if len(optimizer.param_groups) > 1 else None
+        lr_backbone = None
+        if backbone_params_added:
+            lr_backbone = optimizer.param_groups[-1]["lr"]
         epoch_record = {
             "run_id": run_id,
             "phase": "epoch",
@@ -1081,8 +1349,8 @@ def main() -> None:
             "best_metric": best_val_score,
             "timestamp": datetime.now().isoformat(),
         }
-        epoch_history.append(epoch_record)
         write_epoch_history([epoch_record], baseline_log_path)
+
     logger.info("Evaluating on test set")
     if os.path.exists(CONFIG.train.best_model_path):
         model.load_state_dict(torch.load(CONFIG.train.best_model_path, map_location=CONFIG.device))
@@ -1113,7 +1381,7 @@ def main() -> None:
         "val_f1": None,
         "val_auc": None,
         "lr_head": optimizer.param_groups[0]["lr"],
-        "lr_backbone": optimizer.param_groups[1]["lr"] if len(optimizer.param_groups) > 1 else None,
+        "lr_backbone": optimizer.param_groups[-1]["lr"] if backbone_params_added else None,
         "best_metric": best_val_score,
         "test_segment_acc": test_result.get("segment_acc"),
         "test_subject_acc": test_result.get("subject_acc"),
@@ -1121,7 +1389,6 @@ def main() -> None:
         "test_auc": test_result.get("auc"),
         "timestamp": datetime.now().isoformat(),
     }
-    epoch_history.append(test_record)
     write_epoch_history([test_record], baseline_log_path)
     if CONFIG.train.plot_training_curves:
         plot_training_curves(train_losses, val_metrics)
@@ -1130,3 +1397,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
