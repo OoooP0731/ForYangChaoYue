@@ -1161,6 +1161,36 @@ def determine_total_epochs(train_cfg: TrainConfig, feature_type: str) -> int:
     return train_cfg.pretrained_freeze_epochs + train_cfg.pretrained_finetune_epochs
 
 
+def log_training_plan(train_cfg: TrainConfig, data_cfg: DataConfig, model_cfg: ModelConfig) -> None:
+    feature_type = data_cfg.feature_type.lower()
+    if feature_type == "fbank":
+        logger.info(
+            "Training with handcrafted Fbank features (%d mel bins, window %d ms, shift %d ms) for %d epochs (train_cfg.fbank_epochs).",
+            data_cfg.fbank_num_mel,
+            data_cfg.fbank_frame_length_ms,
+            data_cfg.fbank_frame_shift_ms,
+            train_cfg.fbank_epochs,
+        )
+    else:
+        total_epochs = train_cfg.pretrained_freeze_epochs + train_cfg.pretrained_finetune_epochs
+        logger.info(
+            "Training with pretrained %s features. Stage 1: %d frozen epochs, Stage 2: %d finetune epochs (total %d epochs).",
+            model_cfg.model_name,
+            train_cfg.pretrained_freeze_epochs,
+            train_cfg.pretrained_finetune_epochs,
+            total_epochs,
+        )
+
+
+def epoch_stage_name(feature_type: str, epoch: int, train_cfg: TrainConfig) -> str:
+    feature_type = feature_type.lower()
+    if feature_type == "fbank":
+        return "fbank"
+    if epoch <= train_cfg.pretrained_freeze_epochs:
+        return "frozen-backbone"
+    return "finetune-backbone"
+
+
 def build_dataloader(
     dataset: AudioDataset,
     data_cfg: DataConfig,
@@ -1212,6 +1242,7 @@ def main() -> None:
     test_loader = build_dataloader(test_dataset, CONFIG.data, CONFIG.model, CONFIG.train, sampler=None, shuffle=False)
 
     num_classes = len(train_dataset.class_counts) if train_dataset.class_counts else len(set(labels))
+    log_training_plan(CONFIG.train, CONFIG.data, CONFIG.model)
     model = SpeakerVerificationModel(CONFIG.data, CONFIG.model, num_classes).to(CONFIG.device)
     head_params = model.head_parameters()
     optimizer = optim.AdamW(
@@ -1277,8 +1308,25 @@ def main() -> None:
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     backbone_params_added = False
 
+    current_stage = None
     for epoch in range(1, total_epochs + 1):
-        logger.info("Epoch %d/%d", epoch, total_epochs)
+        stage = epoch_stage_name(CONFIG.data.feature_type, epoch, CONFIG.train)
+        if stage != current_stage:
+            current_stage = stage
+            if stage == "fbank":
+                logger.info("Entering Fbank training stage (epochs 1-%d)", total_epochs)
+            elif stage == "frozen-backbone":
+                logger.info(
+                    "Entering pretrained frozen-backbone stage (epochs 1-%d)",
+                    CONFIG.train.pretrained_freeze_epochs,
+                )
+            else:
+                logger.info(
+                    "Entering pretrained finetuning stage (epochs %d-%d)",
+                    CONFIG.train.pretrained_freeze_epochs + 1,
+                    total_epochs,
+                )
+        logger.info("Epoch %d/%d | stage=%s", epoch, total_epochs, stage)
         if (
             CONFIG.data.feature_type.lower() == "pretrained"
             and not backbone_params_added
