@@ -299,7 +299,9 @@ def median_filter_1d(waveform: torch.Tensor, kernel: int) -> torch.Tensor:
     if kernel < 3 or kernel % 2 == 0:
         return waveform
     pad = kernel // 2
-    padded = F.pad(waveform.unsqueeze(0), (pad, pad), mode="reflect").squeeze(0)
+    # torch.nn.functional.pad with reflect mode expects an input of at least 3 dimensions
+    # for 1D padding (N, C, L). Reshape accordingly to avoid NotImplementedError.
+    padded = F.pad(waveform.view(1, 1, -1), (pad, pad), mode="reflect").view(-1)
     windows = padded.unfold(0, kernel, 1)
     return windows.median(dim=-1).values
 
