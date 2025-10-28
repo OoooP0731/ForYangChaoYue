@@ -309,8 +309,13 @@ def median_filter_1d(waveform: torch.Tensor, kernel: int) -> torch.Tensor:
 
 
 def preprocess_waveform(waveform: torch.Tensor, data_cfg: DataConfig) -> torch.Tensor:
-    if waveform.size(0) > 1:
-        waveform = waveform.mean(dim=0)
+    if waveform.dim() == 2:
+        if waveform.size(0) > 1:
+            waveform = waveform.mean(dim=0)
+        else:
+            waveform = waveform.squeeze(0)
+    elif waveform.dim() == 0:
+        waveform = waveform.view(1)
     if data_cfg.normalize_amplitude:
         waveform = normalize_peak_amplitude(waveform)
     if data_cfg.apply_silence_trim:
@@ -325,7 +330,7 @@ def preprocess_waveform(waveform: torch.Tensor, data_cfg: DataConfig) -> torch.T
         waveform = median_filter_1d(waveform, data_cfg.median_filter_kernel)
     if waveform.numel() == 0:
         waveform = torch.zeros(int(data_cfg.sample_rate * 0.5), dtype=torch.float32)
-    return waveform.contiguous()
+    return waveform.reshape(-1).contiguous()
 
 
 def safe_audio_info(path: str) -> Tuple[int, int]:
