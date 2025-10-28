@@ -62,6 +62,7 @@ class ModelConfig:
     use_layer_weighting: bool = True
     ecapa_channels: int = 512
     embedding_dim: int = 192
+    stats_dropout: float = 0.3
 
     @property
     def tag(self) -> str:
@@ -75,7 +76,7 @@ class TrainConfig:
     persistent_workers: bool = True
     head_learning_rate: float = 5e-5
     backbone_learning_rate: float = 3e-5
-    weight_decay: float = 1e-5
+    weight_decay: float = 1e-4
     scheduler_eta_min: float = 1e-6
     max_grad_norm: float = 1.0
     use_amp: bool = True
@@ -100,6 +101,7 @@ class TrainConfig:
     aam_scale: float = 30.0
     inter_topk: int = 5
     inter_margin: float = 0.1
+    label_smoothing: float = 0.1
 
 
 @dataclass
@@ -667,7 +669,7 @@ class AttentiveStatisticsPooling(nn.Module):
 
 
 class ECAPA_TDNN_Small(nn.Module):
-    def __init__(self, input_dim: int, channels: int, embedding_dim: int) -> None:
+    def __init__(self, input_dim: int, channels: int, embedding_dim: int, dropout: float) -> None:
         super().__init__()
         self.layer1 = Conv1dReluBn(input_dim, channels, kernel_size=5)
         self.layer2 = SERes2Block(channels, kernel_size=3, scale=8, dilation=2)
@@ -675,6 +677,7 @@ class ECAPA_TDNN_Small(nn.Module):
         self.layer4 = SERes2Block(channels, kernel_size=3, scale=8, dilation=4)
         self.layer5 = Conv1dReluBn(channels * 3, channels, kernel_size=1)
         self.pooling = AttentiveStatisticsPooling(channels)
+        self.dropout = nn.Dropout(p=dropout)
         self.fc = nn.Linear(channels * 2, embedding_dim)
         self.bn = nn.BatchNorm1d(embedding_dim, affine=False)
 
@@ -687,6 +690,7 @@ class ECAPA_TDNN_Small(nn.Module):
         concat = torch.cat([x2, x3, x4], dim=1)
         context = self.layer5(concat)
         stats = self.pooling(context, lengths)
+        stats = self.dropout(stats)
         embedding = self.fc(stats)
         embedding = self.bn(embedding)
         return F.normalize(embedding, p=2, dim=1)
@@ -743,7 +747,12 @@ class SpeakerVerificationModel(nn.Module):
                 n_hidden = getattr(self.wavlm.config, "num_hidden_layers", len(self.wavlm.encoder.layers))
                 self.layer_weights = nn.Parameter(torch.ones(n_hidden + 1))
         input_dim = model_cfg.hidden_dim if self.feature_type == "pretrained" else data_cfg.fbank_num_mel
-        self.ecapa = ECAPA_TDNN_Small(input_dim, model_cfg.ecapa_channels, model_cfg.embedding_dim)
+        self.ecapa = ECAPA_TDNN_Small(
+            input_dim,
+            model_cfg.ecapa_channels,
+            model_cfg.embedding_dim,
+            dropout=model_cfg.stats_dropout,
+        )
         self.classifier = AAMSoftmaxHead(model_cfg.embedding_dim, num_classes, margin=CONFIG.train.aam_margin, scale=CONFIG.train.aam_scale)
         self.set_backbone_trainable(False)
 
@@ -862,7 +871,11 @@ def train_one_epoch(
         optimizer.zero_grad()
         with autocast(enabled=amp_enabled):
             logits, cosine, target_cosine, _ = model(batch_data, labels)
-            loss = F.cross_entropy(logits, labels)
+            loss = F.cross_entropy(
+                logits,
+                labels,
+                label_smoothing=train_cfg.label_smoothing,
+            )
             if target_cosine is not None:
                 penalty = compute_inter_topk_penalty(
                     cosine,
