@@ -61,6 +61,11 @@ class DataConfig:
     silence_energy_threshold: float = 1e-4
     apply_median_filter: bool = True
     median_filter_kernel: int = 5
+    apply_augmentation: bool = True
+    augmentation_prob: float = 0.6
+    noise_std_range: Tuple[float, float] = (0.001, 0.01)
+    gain_range: Tuple[float, float] = (0.9, 1.1)
+    time_stretch_range: Tuple[float, float] = (0.9, 1.1)
 
 
 @dataclass
@@ -104,6 +109,7 @@ class TrainConfig:
     disable_amp_on_nan: bool = True
     pretrained_freeze_epochs: int = 0
     pretrained_finetune_epochs: int = 25
+    label_smoothing: float = 0.05
 
 
 @dataclass
@@ -376,6 +382,7 @@ class AudioDataset(Dataset):
         self.split = split
         self.segment_length = data_cfg.sample_rate * data_cfg.segment_duration
         self.hop_length = max(1, int(self.segment_length * (1 - data_cfg.overlap_ratio)))
+        self.apply_augmentation = data_cfg.apply_augmentation and split == "train"
         self.samples: List[Dict] = []
         subject_counts = Counter()
         for path, label, subject in tqdm(
@@ -441,10 +448,36 @@ class AudioDataset(Dataset):
         segment = waveform[offset:offset + target]
         return segment, target
 
+    def _augment(self, segment: torch.Tensor) -> torch.Tensor:
+        if not self.apply_augmentation or random.random() > self.data_cfg.augmentation_prob:
+            return segment
+        if random.random() < 0.6:
+            std_min, std_max = self.data_cfg.noise_std_range
+            noise_std = random.uniform(std_min, std_max)
+            segment = segment + torch.randn_like(segment) * noise_std
+        if random.random() < 0.5:
+            gain_min, gain_max = self.data_cfg.gain_range
+            gain = random.uniform(gain_min, gain_max)
+            segment = segment * gain
+        if random.random() < 0.3:
+            cutoff = random.uniform(200.0, min(6000.0, 0.45 * self.data_cfg.sample_rate))
+            segment = torchaudio.functional.lowpass_biquad(
+                segment.unsqueeze(0), self.data_cfg.sample_rate, cutoff
+            ).squeeze(0)
+        if random.random() < 0.3:
+            cutoff = random.uniform(50.0, min(1500.0, 0.45 * self.data_cfg.sample_rate))
+            segment = torchaudio.functional.highpass_biquad(
+                segment.unsqueeze(0), self.data_cfg.sample_rate, cutoff
+            ).squeeze(0)
+        segment = segment.clamp(-1.0, 1.0)
+        return segment
+
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, int, str, int]:
         sample = self.samples[index]
         waveform = self._load_waveform(sample["path"])
         segment, length = self._crop_segment(waveform, sample["offset"])
+        if self.apply_augmentation:
+            segment = self._augment(segment)
         return segment.float(), sample["label"], sample["subject"], length
 
 
@@ -598,7 +631,12 @@ def evaluate(
             with autocast(enabled=use_amp):
                 logits, _ = model(batch)
                 probs = torch.softmax(logits, dim=1)
-            loss = F.cross_entropy(logits.float(), labels, reduction="sum")
+            loss = F.cross_entropy(
+                logits.float(),
+                labels,
+                reduction="sum",
+                label_smoothing=CONFIG.train.label_smoothing,
+            )
             total_loss += loss.item()
             total_samples += labels.size(0)
             all_logits.extend(probs.cpu().tolist())
@@ -664,6 +702,7 @@ def plot_training_curves(
 
     fig.tight_layout()
     fig.savefig(CONFIG.train.curve_path, dpi=300, bbox_inches="tight")
+    plt.show()
     plt.close(fig)
     logger.info("Saved training curves to %s", CONFIG.train.curve_path)
 
@@ -793,7 +832,11 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             with autocast(enabled=amp_enabled):
                 logits, _ = model(batch_data)
-                loss = F.cross_entropy(logits, labels)
+                loss = F.cross_entropy(
+                    logits,
+                    labels,
+                    label_smoothing=CONFIG.train.label_smoothing,
+                )
             if not torch.isfinite(loss):
                 nan_warnings += 1
                 if nan_warnings <= CONFIG.train.max_nan_warnings:
