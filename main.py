@@ -38,11 +38,6 @@ class DataConfig:
     segment_duration: int = 3
     overlap_ratio: float = 0.0
     max_segments_per_subject: Optional[int] = None
-    apply_augmentation: bool = True
-    augmentation_prob: float = 0.6
-    musan_dir: Optional[str] = None
-    dns_dir: Optional[str] = None
-    rir_dir: Optional[str] = None
     normalize_amplitude: bool = True
     apply_silence_trim: bool = True
     silence_frame_ms: int = 25
@@ -412,7 +407,6 @@ class AudioDataset(Dataset):
         self.split = split
         self.segment_length = data_cfg.sample_rate * data_cfg.segment_duration
         self.hop_length = max(1, int(self.segment_length * (1 - data_cfg.overlap_ratio)))
-        self.apply_augmentation = data_cfg.apply_augmentation and split == "train"
         self.samples: List[Dict] = []
         subject_counts = Counter()
         for path, label, subject in tqdm(
@@ -447,19 +441,6 @@ class AudioDataset(Dataset):
         self.sample_weights = self._build_weights()
         self._cache_path: Optional[str] = None
         self._cache_waveform: Optional[torch.Tensor] = None
-        self.musan_paths = self._gather_audio_files(self.data_cfg.musan_dir)
-        self.dns_paths = self._gather_audio_files(self.data_cfg.dns_dir)
-        self.rir_paths = self._gather_audio_files(self.data_cfg.rir_dir)
-
-    def _gather_audio_files(self, directory: Optional[str]) -> List[str]:
-        if directory is None or not os.path.isdir(directory):
-            return []
-        paths: List[str] = []
-        for root, _, files in os.walk(directory):
-            for name in files:
-                if name.lower().endswith((".wav", ".flac", ".ogg")):
-                    paths.append(os.path.join(root, name))
-        return paths
 
     def _build_weights(self) -> torch.DoubleTensor:
         if not self.samples:
@@ -492,80 +473,6 @@ class AudioDataset(Dataset):
             self._cache_waveform = waveform.contiguous()
         return self._cache_waveform.clone()
 
-    def _select_random_audio(self, paths: List[str], target_len: int) -> Optional[torch.Tensor]:
-        if not paths:
-            return None
-        path = random.choice(paths)
-        waveform, sample_rate = safe_audio_load(path)
-        if waveform.size(0) > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
-        waveform = waveform.squeeze(0)
-        if sample_rate != self.data_cfg.sample_rate:
-            waveform = torchaudio.functional.resample(
-                waveform.unsqueeze(0),
-                sample_rate,
-                self.data_cfg.sample_rate,
-            ).squeeze(0)
-        if waveform.numel() < target_len:
-            repeats = max(1, math.ceil(target_len / max(waveform.numel(), 1)))
-            waveform = waveform.repeat(repeats)
-        start = random.randint(0, max(0, waveform.numel() - target_len))
-        return waveform[start : start + target_len]
-
-    def _apply_musan_noise(self, segment: torch.Tensor) -> torch.Tensor:
-        noise = self._select_random_audio(self.musan_paths, segment.numel())
-        if noise is None:
-            return segment
-        snr_db = random.uniform(0.0, 15.0)
-        signal_power = segment.pow(2).mean().item() + 1e-9
-        noise_power = noise.pow(2).mean().item() + 1e-9
-        desired_noise_power = signal_power / (10 ** (snr_db / 10.0))
-        scale = math.sqrt(desired_noise_power / noise_power)
-        noisy = segment + noise * scale
-        return noisy.clamp(-1.0, 1.0)
-
-    def _apply_dns_noise(self, segment: torch.Tensor) -> torch.Tensor:
-        noise = self._select_random_audio(self.dns_paths, segment.numel())
-        if noise is None:
-            return segment
-        snr_db = random.uniform(5.0, 20.0)
-        signal_power = segment.pow(2).mean().item() + 1e-9
-        noise_power = noise.pow(2).mean().item() + 1e-9
-        desired_noise_power = signal_power / (10 ** (snr_db / 10.0))
-        scale = math.sqrt(desired_noise_power / noise_power)
-        noisy = segment + noise * scale
-        return noisy.clamp(-1.0, 1.0)
-
-    def _apply_rir(self, segment: torch.Tensor) -> torch.Tensor:
-        rir = self._select_random_audio(self.rir_paths, self.data_cfg.sample_rate)
-        if rir is None:
-            return segment
-        rir = rir / (rir.norm(p=2) + 1e-9)
-        rir = rir.flip(0)
-        augmented = F.conv1d(
-            segment.unsqueeze(0).unsqueeze(0),
-            rir.unsqueeze(0).unsqueeze(0),
-        ).squeeze(0).squeeze(0)
-        if augmented.numel() < segment.numel():
-            augmented = F.pad(augmented, (0, segment.numel() - augmented.numel()))
-        else:
-            augmented = augmented[: segment.numel()]
-        return augmented.clamp(-1.0, 1.0)
-
-    def _augment(self, segment: torch.Tensor) -> torch.Tensor:
-        if not self.apply_augmentation or random.random() >= self.data_cfg.augmentation_prob:
-            return segment
-        augmentation_choices = [
-            (self._apply_musan_noise, bool(self.musan_paths)),
-            (self._apply_dns_noise, bool(self.dns_paths)),
-            (self._apply_rir, bool(self.rir_paths)),
-        ]
-        valid = [fn for fn, available in augmentation_choices if available]
-        if not valid:
-            return segment
-        fn = random.choice(valid)
-        return fn(segment)
-
     def _crop_segment(self, waveform: torch.Tensor, offset: int) -> Tuple[torch.Tensor, int]:
         target = self.segment_length
         if waveform.size(0) <= target:
@@ -580,8 +487,6 @@ class AudioDataset(Dataset):
         sample = self.samples[index]
         waveform = self._load_waveform(sample["path"])
         segment, length = self._crop_segment(waveform, sample["offset"])
-        if self.apply_augmentation:
-            segment = self._augment(segment)
         return segment.float(), sample["label"], sample["subject"], length
 
 
