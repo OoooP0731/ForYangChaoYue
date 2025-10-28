@@ -298,6 +298,8 @@ def trim_silence(
 def median_filter_1d(waveform: torch.Tensor, kernel: int) -> torch.Tensor:
     if kernel < 3 or kernel % 2 == 0:
         return waveform
+    if waveform.numel() < kernel:
+        return waveform
     pad = kernel // 2
     # torch.nn.functional.pad with reflect mode expects an input of at least 3 dimensions
     # for 1D padding (N, C, L). Reshape accordingly to avoid NotImplementedError.
