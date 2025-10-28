@@ -528,15 +528,44 @@ class Wav2Vec2Classifier(nn.Module):
         return [p for p in self.backbone.parameters() if p.requires_grad]
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        attention_mask = batch.get("attention_mask")
         outputs = self.backbone(
             batch["input_values"],
-            attention_mask=batch.get("attention_mask"),
+            attention_mask=attention_mask,
             output_hidden_states=False,
         )
         hidden_states = outputs.last_hidden_state
-        mask = batch["attention_mask"].unsqueeze(-1).type_as(hidden_states)
+        if attention_mask is None:
+            input_mask = torch.ones(
+                batch["input_values"].size()[:2],
+                device=hidden_states.device,
+                dtype=torch.long,
+            )
+        else:
+            input_mask = attention_mask.to(hidden_states.device)
+        input_lengths = input_mask.sum(dim=1)
+        if hasattr(self.backbone, "_get_feat_extract_output_lengths"):
+            feat_lengths = self.backbone._get_feat_extract_output_lengths(input_lengths)
+            feat_lengths = feat_lengths.to(hidden_states.device)
+        else:
+            conv_stride = getattr(self.backbone.config, "conv_stride", None)
+            if conv_stride is None and hasattr(self.backbone, "feature_extractor"):
+                conv_stride = [
+                    layer.stride[0]
+                    for layer in getattr(self.backbone.feature_extractor, "conv_layers", [])
+                ]
+            stride = int(np.prod(conv_stride)) if conv_stride else 1
+            feat_lengths = torch.div(
+                input_lengths + stride - 1,
+                stride,
+                rounding_mode="floor",
+            ).to(hidden_states.device)
+        max_len = hidden_states.size(1)
+        frame_index = torch.arange(max_len, device=hidden_states.device).unsqueeze(0)
+        frame_mask = frame_index < feat_lengths.unsqueeze(1)
+        mask = frame_mask.unsqueeze(-1).type_as(hidden_states)
         masked = hidden_states * mask
-        lengths = mask.sum(dim=1).clamp(min=1.0)
+        lengths = frame_mask.sum(dim=1, keepdim=True).clamp(min=1).type_as(hidden_states)
         pooled = masked.sum(dim=1) / lengths
         logits = self.classifier(self.dropout(pooled))
         return logits, pooled
