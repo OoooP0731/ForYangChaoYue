@@ -10,11 +10,10 @@ This module implements a lightweight pipeline that
 """
 
 import logging
-import math
 import os
 import random
 import warnings
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -26,6 +25,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
+import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, roc_auc_score
 from torch.cuda.amp import GradScaler, autocast
 from torch.nn.utils import clip_grad_norm_
@@ -51,7 +51,7 @@ def _safe_model_tag(model_name: str) -> str:
 class DataConfig:
     data_dir: str = "./audio_lanzhou_2015"
     sample_rate: int = 16000
-    segment_duration: int = 3
+    segment_duration: int = 7
     overlap_ratio: float = 0.0
     max_segments_per_subject: Optional[int] = None
     normalize_amplitude: bool = True
@@ -79,12 +79,12 @@ class ModelConfig:
 
 @dataclass
 class TrainConfig:
-    batch_size: int = 16
+    batch_size: int = 32
     num_workers: int = 4
     persistent_workers: bool = True
-    head_learning_rate: float = 1e-4
-    backbone_learning_rate: float = 5e-6
-    weight_decay: float = 1e-5
+    head_learning_rate: float = 6e-3
+    backbone_learning_rate: float = 1e-5
+    weight_decay: float = 1e-3
     scheduler_eta_min: float = 1e-6
     max_grad_norm: float = 1.0
     use_amp: bool = True
@@ -93,17 +93,17 @@ class TrainConfig:
     test_ratio: float = 0.15
     random_seed: int = 24
     resume_from_best: bool = False
-    best_model_path: str = "best_model.pt"
+    best_model_path: str = "best_segment_model.pt"
     log_dir: str = "logs_wav2vec2"
     curve_path: str = "curves_wav2vec2.png"
-    val_selection_metric: str = "subject"
+    val_selection_metric: str = "segment"
     log_eval_details: bool = True
     plot_training_curves: bool = True
     max_nan_warnings: int = 3
     nan_lr_scale: float = 0.5
     disable_amp_on_nan: bool = True
-    pretrained_freeze_epochs: int = 15
-    pretrained_finetune_epochs: int = 10
+    pretrained_freeze_epochs: int = 0
+    pretrained_finetune_epochs: int = 25
 
 
 @dataclass
@@ -118,7 +118,7 @@ class ExperimentConfig:
 
 
 CONFIG = ExperimentConfig()
-CONFIG.train.best_model_path = f"best_model_{CONFIG.model.tag}.pt"
+CONFIG.train.best_model_path = f"best_segment_model_{CONFIG.model.tag}.pt"
 CONFIG.train.log_dir = f"logs_{CONFIG.model.tag}"
 CONFIG.train.curve_path = f"training_curves_by_{CONFIG.model.tag}.png"
 
@@ -579,30 +579,6 @@ def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device) -
     return {key: tensor.to(device) if torch.is_tensor(tensor) else tensor for key, tensor in batch.items()}
 
 
-def compute_subject_metrics(
-    logits: List[List[float]],
-    labels: List[int],
-    subjects: List[str],
-) -> Tuple[float, Optional[np.ndarray]]:
-    subject_logits: Dict[str, List[List[float]]] = defaultdict(list)
-    subject_true: Dict[str, int] = {}
-    for logit, label, subject in zip(logits, labels, subjects):
-        subject_logits[subject].append(logit)
-        subject_true[subject] = label
-    if not subject_logits:
-        return 0.0, None
-    subject_preds: List[int] = []
-    subject_labels: List[int] = []
-    for subject, logit_list in subject_logits.items():
-        mean_logits = torch.tensor(logit_list, dtype=torch.float32).mean(dim=0)
-        pred = int(torch.argmax(mean_logits).item())
-        subject_preds.append(pred)
-        subject_labels.append(subject_true[subject])
-    subject_acc = accuracy_score(subject_labels, subject_preds)
-    cm = confusion_matrix(subject_labels, subject_preds, labels=[0, 1]) if subject_labels else None
-    return subject_acc, cm
-
-
 def evaluate(
     model: Wav2Vec2Classifier,
     dataloader: DataLoader,
@@ -613,27 +589,29 @@ def evaluate(
     model.eval()
     all_logits: List[List[float]] = []
     all_labels: List[int] = []
-    all_subjects: List[str] = []
+    total_loss = 0.0
+    total_samples = 0
     with torch.no_grad():
-        for batch, labels, subjects in tqdm(dataloader, desc=f"Evaluating[{split_name}]", leave=False):
+        for batch, labels, _ in tqdm(dataloader, desc=f"Evaluating[{split_name}]", leave=False):
             batch = move_batch_to_device(batch, device)
             labels = labels.to(device)
             with autocast(enabled=use_amp):
                 logits, _ = model(batch)
                 probs = torch.softmax(logits, dim=1)
+            loss = F.cross_entropy(logits.float(), labels, reduction="sum")
+            total_loss += loss.item()
+            total_samples += labels.size(0)
             all_logits.extend(probs.cpu().tolist())
             all_labels.extend(labels.cpu().tolist())
-            all_subjects.extend(subjects)
 
     results: Dict[str, float] = {
         "segment_acc": 0.0,
-        "subject_acc": 0.0,
         "f1": 0.0,
         "auc": float("nan"),
+        "loss": total_loss / max(total_samples, 1),
     }
     if not all_labels:
         results["confusion_matrix"] = None
-        results["subject_confusion_matrix"] = None
         return results
 
     preds = [int(np.argmax(logit)) for logit in all_logits]
@@ -646,19 +624,48 @@ def evaluate(
         results["auc"] = float("nan")
     results["confusion_matrix"] = confusion_matrix(all_labels, preds, labels=[0, 1])
 
-    subject_acc, subject_cm = compute_subject_metrics(all_logits, all_labels, all_subjects)
-    results["subject_acc"] = subject_acc
-    results["subject_confusion_matrix"] = subject_cm
-
     logger.info(
-        "[%s] Segment acc=%.4f | Subject acc=%.4f | F1=%.4f | AUC=%.4f",
+        "[%s] Segment acc=%.4f | F1=%.4f | AUC=%.4f | loss=%.4f",
         split_name,
         results["segment_acc"],
-        results["subject_acc"],
         results["f1"],
         results["auc"],
+        results["loss"],
     )
     return results
+
+
+def plot_training_curves(
+    train_losses: List[float],
+    val_losses: List[float],
+    val_accuracies: List[float],
+    val_f1s: List[float],
+) -> None:
+    if not train_losses:
+        return
+    epochs = list(range(1, len(train_losses) + 1))
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    axes[0].plot(epochs, train_losses, label="Train Loss")
+    axes[0].plot(epochs, val_losses, label="Val Loss")
+    axes[0].set_title("Loss over Epochs")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Loss")
+    axes[0].grid(True)
+    axes[0].legend()
+
+    axes[1].plot(epochs, val_accuracies, label="Val Segment Acc")
+    axes[1].plot(epochs, val_f1s, label="Val F1")
+    axes[1].set_title("Validation Metrics")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("Score")
+    axes[1].grid(True)
+    axes[1].legend()
+
+    fig.tight_layout()
+    fig.savefig(CONFIG.train.curve_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved training curves to %s", CONFIG.train.curve_path)
 
 
 def build_dataloader(
@@ -730,7 +737,7 @@ def main() -> None:
     optimizer_groups = [
         {"params": model.head_parameters(), "lr": CONFIG.train.head_learning_rate},
     ]
-    optimizer = torch.optim.AdamW(optimizer_groups, weight_decay=CONFIG.train.weight_decay)
+    optimizer = torch.optim.Adam(optimizer_groups, weight_decay=CONFIG.train.weight_decay)
     total_epochs = determine_total_epochs(CONFIG.train)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
@@ -739,9 +746,16 @@ def main() -> None:
     )
     scaler = GradScaler(enabled=CONFIG.train.use_amp and CONFIG.device.type == "cuda")
 
-    metric_field = "subject_acc" if CONFIG.train.val_selection_metric.lower() == "subject" else "segment_acc"
+    metric_field = "segment_acc"
     best_val_score = float("-inf")
     backbone_params_added = False
+    epochs_without_improvement = 0
+
+    train_losses: List[float] = []
+    val_losses: List[float] = []
+    val_accuracies: List[float] = []
+    val_f1s: List[float] = []
+    history_records: List[Dict[str, float]] = []
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -827,6 +841,8 @@ def main() -> None:
         accuracy = correct / total if total > 0 else 0.0
         logger.info("Train | loss=%.4f | acc=%.4f", avg_loss, accuracy)
 
+        train_losses.append(avg_loss)
+
         val_result = evaluate(
             model,
             val_loader,
@@ -834,6 +850,22 @@ def main() -> None:
             use_amp=False,
             split_name=f"val-epoch{epoch}",
         )
+        val_losses.append(val_result.get("loss", 0.0))
+        val_accuracies.append(val_result.get("segment_acc", 0.0))
+        val_f1s.append(val_result.get("f1", 0.0))
+
+        history_records.append(
+            {
+                "epoch": epoch,
+                "train_loss": avg_loss,
+                "train_acc": accuracy,
+                "val_loss": val_result.get("loss", 0.0),
+                "val_segment_acc": val_result.get("segment_acc", 0.0),
+                "val_f1": val_result.get("f1", 0.0),
+                "val_auc": val_result.get("auc", float("nan")),
+            }
+        )
+
         current_score = val_result.get(metric_field, float("-inf"))
         if current_score > best_val_score:
             best_val_score = current_score
@@ -845,8 +877,31 @@ def main() -> None:
                 best_val_score,
                 CONFIG.train.best_model_path,
             )
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+            logger.info(
+                "Validation %s did not improve for %d epoch(s)",
+                metric_field,
+                epochs_without_improvement,
+            )
+            if epochs_without_improvement >= 5:
+                logger.info(
+                    "Early stopping triggered after %d epochs without improvement.",
+                    epochs_without_improvement,
+                )
+                break
 
         scheduler.step()
+
+    if history_records:
+        history_df = pd.DataFrame(history_records)
+        history_path = os.path.join(CONFIG.train.log_dir, f"training_history_{run_id}.csv")
+        history_df.to_csv(history_path, index=False)
+        logger.info("Saved training history to %s", history_path)
+
+    if CONFIG.train.plot_training_curves and train_losses:
+        plot_training_curves(train_losses, val_losses, val_accuracies, val_f1s)
 
     logger.info("Evaluating on test set")
     if os.path.exists(CONFIG.train.best_model_path):
@@ -859,11 +914,11 @@ def main() -> None:
         split_name="test",
     )
     logger.info(
-        "Test | segment_acc=%.4f | subject_acc=%.4f | f1=%.4f | auc=%.4f",
+        "Test | segment_acc=%.4f | f1=%.4f | auc=%.4f | loss=%.4f",
         test_result.get("segment_acc", 0.0),
-        test_result.get("subject_acc", 0.0),
         test_result.get("f1", 0.0),
         test_result.get("auc", float("nan")),
+        test_result.get("loss", 0.0),
     )
     logger.info("Confusion matrix:\n%s", test_result.get("confusion_matrix"))
 
