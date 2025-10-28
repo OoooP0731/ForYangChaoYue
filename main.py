@@ -401,17 +401,15 @@ class AudioDataset(Dataset):
         self,
         data: Dict[str, List],
         data_cfg: DataConfig,
-        split: str,
     ) -> None:
         self.data_cfg = data_cfg
-        self.split = split
         self.segment_length = data_cfg.sample_rate * data_cfg.segment_duration
         self.hop_length = max(1, int(self.segment_length * (1 - data_cfg.overlap_ratio)))
         self.samples: List[Dict] = []
         subject_counts = Counter()
         for path, label, subject in tqdm(
             list(zip(data["paths"], data["labels"], data["subjects"])),
-            desc=f"Indexing audio [{split}]",
+            desc="Indexing audio",
             total=len(data["paths"]),
         ):
             try:
@@ -1130,9 +1128,9 @@ def main() -> None:
     seed_everything(CONFIG.train.random_seed)
     file_paths, labels, subjects = load_metadata(CONFIG.data)
     train_data, val_data, test_data = split_by_subject(file_paths, labels, subjects, CONFIG.train)
-    train_dataset = AudioDataset(train_data, CONFIG.data, split="train")
-    val_dataset = AudioDataset(val_data, CONFIG.data, split="val")
-    test_dataset = AudioDataset(test_data, CONFIG.data, split="test")
+    train_dataset = AudioDataset(train_data, CONFIG.data)
+    val_dataset = AudioDataset(val_data, CONFIG.data)
+    test_dataset = AudioDataset(test_data, CONFIG.data)
     if not len(train_dataset):
         raise RuntimeError("Training dataset is empty.")
     sampler = None
