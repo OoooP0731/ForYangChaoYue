@@ -460,12 +460,18 @@ def collate_fn(
         segments_np,
         sampling_rate=data_cfg.sample_rate,
         padding=True,
+        return_attention_mask=True,
         return_tensors="pt",
     )
+    attention_mask = processed.get("attention_mask")
+    if attention_mask is None:
+        attention_mask = torch.ones_like(processed.input_values, dtype=torch.long)
+    else:
+        attention_mask = attention_mask.long()
     return (
         {
             "input_values": processed.input_values,
-            "attention_mask": processed.attention_mask.long(),
+            "attention_mask": attention_mask,
             "sample_lengths": torch.tensor(lengths, dtype=torch.long),
         },
         torch.tensor(labels, dtype=torch.long),
