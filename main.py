@@ -26,7 +26,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
 import matplotlib.pyplot as plt
-from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, roc_auc_score
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 from torch.cuda.amp import GradScaler, autocast
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
@@ -713,6 +720,8 @@ def evaluate(
 
     results: Dict[str, float] = {
         "segment_acc": 0.0,
+        "precision": 0.0,
+        "recall": 0.0,
         "f1": 0.0,
         "auc": float("nan"),
         "loss": total_loss / max(total_samples, 1),
@@ -723,6 +732,8 @@ def evaluate(
 
     preds = [int(np.argmax(logit)) for logit in all_logits]
     results["segment_acc"] = accuracy_score(all_labels, preds)
+    results["precision"] = precision_score(all_labels, preds, zero_division=0)
+    results["recall"] = recall_score(all_labels, preds, zero_division=0)
     results["f1"] = f1_score(all_labels, preds, zero_division=0)
     try:
         if len(set(all_labels)) > 1:
@@ -732,9 +743,11 @@ def evaluate(
     results["confusion_matrix"] = confusion_matrix(all_labels, preds, labels=[0, 1])
 
     logger.info(
-        "[%s] Segment acc=%.4f | F1=%.4f | AUC=%.4f | loss=%.4f",
+        "[%s] Segment acc=%.4f | precision=%.4f | recall=%.4f | F1=%.4f | AUC=%.4f | loss=%.4f",
         split_name,
         results["segment_acc"],
+        results["precision"],
+        results["recall"],
         results["f1"],
         results["auc"],
         results["loss"],
@@ -746,12 +759,15 @@ def plot_training_curves(
     train_losses: List[float],
     val_losses: List[float],
     val_accuracies: List[float],
+    val_precisions: List[float],
+    val_recalls: List[float],
     val_f1s: List[float],
+    val_aucs: List[float],
 ) -> None:
     if not train_losses:
         return
     epochs = list(range(1, len(train_losses) + 1))
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
     axes[0].plot(epochs, train_losses, label="Train Loss")
     axes[0].plot(epochs, val_losses, label="Val Loss")
@@ -761,8 +777,12 @@ def plot_training_curves(
     axes[0].grid(True)
     axes[0].legend()
 
-    axes[1].plot(epochs, val_accuracies, label="Val Segment Acc")
+    axes[1].plot(epochs, val_accuracies, label="Val Acc")
+    axes[1].plot(epochs, val_precisions, label="Val Precision")
+    axes[1].plot(epochs, val_recalls, label="Val Recall")
     axes[1].plot(epochs, val_f1s, label="Val F1")
+    if val_aucs:
+        axes[1].plot(epochs, val_aucs, label="Val AUC")
     axes[1].set_title("Validation Metrics")
     axes[1].set_xlabel("Epoch")
     axes[1].set_ylabel("Score")
@@ -862,7 +882,10 @@ def main() -> None:
     train_losses: List[float] = []
     val_losses: List[float] = []
     val_accuracies: List[float] = []
+    val_precisions: List[float] = []
+    val_recalls: List[float] = []
     val_f1s: List[float] = []
+    val_aucs: List[float] = []
     history_records: List[Dict[str, float]] = []
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -964,7 +987,10 @@ def main() -> None:
         )
         val_losses.append(val_result.get("loss", 0.0))
         val_accuracies.append(val_result.get("segment_acc", 0.0))
+        val_precisions.append(val_result.get("precision", 0.0))
+        val_recalls.append(val_result.get("recall", 0.0))
         val_f1s.append(val_result.get("f1", 0.0))
+        val_aucs.append(val_result.get("auc", float("nan")))
 
         history_records.append(
             {
@@ -973,6 +999,8 @@ def main() -> None:
                 "train_acc": accuracy,
                 "val_loss": val_result.get("loss", 0.0),
                 "val_segment_acc": val_result.get("segment_acc", 0.0),
+                "val_precision": val_result.get("precision", 0.0),
+                "val_recall": val_result.get("recall", 0.0),
                 "val_f1": val_result.get("f1", 0.0),
                 "val_auc": val_result.get("auc", float("nan")),
             }
@@ -1013,7 +1041,15 @@ def main() -> None:
         logger.info("Saved training history to %s", history_path)
 
     if CONFIG.train.plot_training_curves and train_losses:
-        plot_training_curves(train_losses, val_losses, val_accuracies, val_f1s)
+        plot_training_curves(
+            train_losses,
+            val_losses,
+            val_accuracies,
+            val_precisions,
+            val_recalls,
+            val_f1s,
+            val_aucs,
+        )
 
     logger.info("Evaluating on test set")
     if os.path.exists(CONFIG.train.best_model_path):
@@ -1026,8 +1062,10 @@ def main() -> None:
         split_name="test",
     )
     logger.info(
-        "Test | segment_acc=%.4f | f1=%.4f | auc=%.4f | loss=%.4f",
+        "Test | segment_acc=%.4f | precision=%.4f | recall=%.4f | f1=%.4f | auc=%.4f | loss=%.4f",
         test_result.get("segment_acc", 0.0),
+        test_result.get("precision", 0.0),
+        test_result.get("recall", 0.0),
         test_result.get("f1", 0.0),
         test_result.get("auc", float("nan")),
         test_result.get("loss", 0.0),
