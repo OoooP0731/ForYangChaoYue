@@ -1274,9 +1274,21 @@ def run_training() -> None:
             subject_best.get("subject_auc", float("nan")),
         )
 
+    def _to_serializable(obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, (np.floating, np.integer)):
+            return obj.item()
+        if isinstance(obj, dict):
+            return {k: _to_serializable(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_to_serializable(v) for v in obj]
+        return obj
+
+    serializable_metrics = _to_serializable(test_metrics)
     metrics_path = os.path.join(CONFIG.train.log_dir, f"test_metrics_{run_id}.json")
     with open(metrics_path, "w", encoding="utf-8") as f:
-        json.dump(test_metrics, f, ensure_ascii=False, indent=2)
+        json.dump(serializable_metrics, f, ensure_ascii=False, indent=2)
     logger.info("Saved test metrics to %s", metrics_path)
 
 
