@@ -503,13 +503,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cmdc_dir",
         type=str,
-        default=None,
-        help="Path to the CMDC dataset root (defaults to ./CMDC next to this script)",
+        default="./CMDC",
+        help="Path to the CMDC dataset root (defaults to ./CMDC relative to the working directory)",
     )
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default=str(SCRIPT_DIR / "best_model_wavlm_lagre.pt"),
+        default="./best_model_wavlm_lagre.pt",
         help="Checkpoint file produced by MODMA training",
     )
     parser.add_argument(
@@ -561,8 +561,9 @@ def main() -> None:
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     os.environ.setdefault("HF_HOME", model_cfg.hf_cache_dir)
 
-    default_cmdc = SCRIPT_DIR / "CMDC"
-    cmdc_dir = Path(args.cmdc_dir).expanduser().resolve() if args.cmdc_dir else default_cmdc.resolve()
+    cmdc_dir = Path(args.cmdc_dir).expanduser()
+    if not cmdc_dir.is_absolute():
+        cmdc_dir = (Path.cwd() / cmdc_dir).resolve()
     if not os.path.isdir(cmdc_dir):
         raise FileNotFoundError(
             "CMDC directory not found. Pass --cmdc_dir or place the dataset in ./CMDC."
@@ -598,7 +599,7 @@ def main() -> None:
 
     checkpoint_path = Path(args.checkpoint).expanduser()
     if not checkpoint_path.is_absolute():
-        checkpoint_path = (SCRIPT_DIR / checkpoint_path).resolve()
+        checkpoint_path = (Path.cwd() / checkpoint_path).resolve()
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     state_dict = torch.load(str(checkpoint_path), map_location=device)
