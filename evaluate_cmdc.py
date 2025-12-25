@@ -491,13 +491,21 @@ def evaluate(
 # ---------------------------------------------------------------------------
 
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate a pretrained model on CMDC")
-    parser.add_argument("--cmdc_dir", type=str, required=True, help="Path to the CMDC dataset root")
+    parser.add_argument(
+        "--cmdc_dir",
+        type=str,
+        default=None,
+        help="Path to the CMDC dataset root (defaults to ./CMDC next to this script)",
+    )
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="best_model_wavlm_lagre.pt",
+        default=os.path.join(SCRIPT_DIR, "best_model_wavlm_lagre.pt"),
         help="Checkpoint file produced by MODMA training",
     )
     parser.add_argument(
@@ -548,8 +556,14 @@ def main() -> None:
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     os.environ.setdefault("HF_HOME", model_cfg.hf_cache_dir)
 
+    cmdc_dir = args.cmdc_dir or os.path.join(SCRIPT_DIR, "CMDC")
+    if not os.path.isdir(cmdc_dir):
+        raise FileNotFoundError(
+            "CMDC directory not found. Pass --cmdc_dir or place the dataset in ./CMDC."
+        )
+
     print("Discovering CMDC audio segments...")
-    samples = discover_cmdc_segments(args.cmdc_dir, data_cfg)
+    samples = discover_cmdc_segments(cmdc_dir, data_cfg)
     random.Random(args.seed).shuffle(samples)
     subject_set = {s["subject"] for s in samples}
     label_counts = Counter(sample["label"] for sample in samples)
@@ -576,9 +590,12 @@ def main() -> None:
     device = torch.device(args.device)
     model = WavClassifier(model_cfg, num_classes=2).to(device)
 
-    if not os.path.exists(args.checkpoint):
-        raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
-    state_dict = torch.load(args.checkpoint, map_location=device)
+    checkpoint_path = args.checkpoint
+    if not os.path.isabs(checkpoint_path):
+        checkpoint_path = os.path.join(SCRIPT_DIR, checkpoint_path)
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    state_dict = torch.load(checkpoint_path, map_location=device)
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:
         print(f"Warning: Missing keys when loading checkpoint: {missing}")
