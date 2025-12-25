@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import os
 import random
+from collections import Counter
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -144,12 +145,13 @@ def discover_cmdc_segments(
                 num_frames, sample_rate = safe_audio_info(wav_path)
                 if num_frames <= 0:
                     continue
-                if sample_rate != data_cfg.sample_rate:
-                    # Frame counts will be recomputed after resampling – treat
-                    # as unknown length and just take at least one segment.
-                    num_frames = -1
 
-                if num_frames > 0 and num_frames <= segment_length:
+                if sample_rate != data_cfg.sample_rate and sample_rate > 0:
+                    resampled_frames = int(round(num_frames * data_cfg.sample_rate / sample_rate))
+                else:
+                    resampled_frames = num_frames
+
+                if resampled_frames <= segment_length:
                     samples.append(
                         {
                             "path": wav_path,
@@ -161,12 +163,9 @@ def discover_cmdc_segments(
                     subject_counts[subject_id] += 1
                     continue
 
-                # Sliding-window segmentation for longer recordings.
-                start_positions = [0]
-                if num_frames > 0:
-                    start_positions = list(range(0, num_frames - segment_length + 1, hop_length))
-                    if not start_positions:
-                        start_positions = [0]
+                start_positions = list(range(0, max(resampled_frames - segment_length + 1, 1), hop_length))
+                if not start_positions:
+                    start_positions = [0]
 
                 for offset in start_positions:
                     max_segments = data_cfg.max_segments_per_subject
@@ -551,7 +550,13 @@ def main() -> None:
 
     print("Discovering CMDC audio segments...")
     samples = discover_cmdc_segments(args.cmdc_dir, data_cfg)
-    print(f"Found {len(samples)} segments across {len({s['subject'] for s in samples})} subjects.")
+    random.Random(args.seed).shuffle(samples)
+    subject_set = {s["subject"] for s in samples}
+    label_counts = Counter(sample["label"] for sample in samples)
+    print(
+        f"Found {len(samples)} segments across {len(subject_set)} subjects "
+        f"(HC segments: {label_counts.get(0, 0)}, MDD segments: {label_counts.get(1, 0)})."
+    )
 
     dataset = CmdcDataset(samples, data_cfg)
     extractor = build_feature_extractor(model_cfg)
