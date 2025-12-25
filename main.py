@@ -66,6 +66,11 @@ class DataConfig:
     noise_std_range: Tuple[float, float] = (0.001, 0.01)
     gain_range: Tuple[float, float] = (0.9, 1.1)
     time_stretch_range: Tuple[float, float] = (0.9, 1.1)
+    time_stretch_prob: float = 0.3
+    time_shift_max_ratio: float = 0.2
+    time_shift_prob: float = 0.4
+    time_dropout_prob: float = 0.4
+    time_dropout_max_ratio: float = 0.1
 
 
 @dataclass
@@ -74,7 +79,9 @@ class ModelConfig:
     hf_cache_dir: str = "./hf_cache"
     local_files_only: bool = False
     force_offline: bool = False
-    dropout: float = 0.1
+    dropout: float = 0.3
+    frame_dropout: float = 0.1
+    classifier_hidden_dim: int = 256
     unfreeze_last_n_layers: int = 2
 
     @property
@@ -107,9 +114,9 @@ class TrainConfig:
     max_nan_warnings: int = 3
     nan_lr_scale: float = 0.5
     disable_amp_on_nan: bool = True
-    pretrained_freeze_epochs: int = 0
-    pretrained_finetune_epochs: int = 25
-    label_smoothing: float = 0.05
+    pretrained_freeze_epochs: int = 5
+    pretrained_finetune_epochs: int = 20
+    label_smoothing: float = 0.1
 
 
 @dataclass
@@ -448,9 +455,61 @@ class AudioDataset(Dataset):
         segment = waveform[offset:offset + target]
         return segment, target
 
+    def _time_stretch(self, segment: torch.Tensor) -> torch.Tensor:
+        min_rate, max_rate = self.data_cfg.time_stretch_range
+        if max_rate <= 0 or min_rate <= 0:
+            return segment
+        rate = random.uniform(min_rate, max_rate)
+        if abs(rate - 1.0) < 1e-2:
+            return segment
+        new_sr = max(1, int(self.data_cfg.sample_rate * rate))
+        stretched = torchaudio.functional.resample(
+            segment.unsqueeze(0),
+            self.data_cfg.sample_rate,
+            new_sr,
+        ).squeeze(0)
+        target = segment.size(0)
+        if stretched.size(0) > target:
+            start = random.randint(0, stretched.size(0) - target)
+            stretched = stretched[start:start + target]
+        elif stretched.size(0) < target:
+            stretched = F.pad(stretched, (0, target - stretched.size(0)))
+        return stretched
+
+    def _time_shift(self, segment: torch.Tensor) -> torch.Tensor:
+        max_ratio = self.data_cfg.time_shift_max_ratio
+        if max_ratio <= 0:
+            return segment
+        max_shift = int(segment.size(0) * max_ratio)
+        if max_shift <= 0:
+            return segment
+        shift = random.randint(-max_shift, max_shift)
+        if shift == 0:
+            return segment
+        return torch.roll(segment, shifts=shift)
+
+    def _time_dropout(self, segment: torch.Tensor) -> torch.Tensor:
+        max_ratio = self.data_cfg.time_dropout_max_ratio
+        if max_ratio <= 0:
+            return segment
+        max_span = int(segment.size(0) * max_ratio)
+        if max_span <= 0:
+            return segment
+        span = random.randint(1, max_span)
+        start = random.randint(0, max(0, segment.size(0) - span))
+        dropped = segment.clone()
+        dropped[start:start + span] = 0.0
+        return dropped
+
     def _augment(self, segment: torch.Tensor) -> torch.Tensor:
         if not self.apply_augmentation or random.random() > self.data_cfg.augmentation_prob:
             return segment
+        if random.random() < self.data_cfg.time_stretch_prob:
+            segment = self._time_stretch(segment)
+        if random.random() < self.data_cfg.time_shift_prob:
+            segment = self._time_shift(segment)
+        if random.random() < self.data_cfg.time_dropout_prob:
+            segment = self._time_dropout(segment)
         if random.random() < 0.6:
             std_min, std_max = self.data_cfg.noise_std_range
             noise_std = random.uniform(std_min, std_max)
@@ -526,8 +585,16 @@ class Wav2Vec2Classifier(nn.Module):
             local_files_only=model_cfg.local_files_only,
         )
         hidden_size = self.backbone.config.hidden_size
+        hidden_dim = model_cfg.classifier_hidden_dim if model_cfg.classifier_hidden_dim > 0 else hidden_size
+        self.frame_dropout = nn.Dropout(model_cfg.frame_dropout)
+        self.pre_classifier_norm = nn.LayerNorm(hidden_size)
         self.dropout = nn.Dropout(model_cfg.dropout)
-        self.classifier = nn.Linear(hidden_size, num_classes)
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(model_cfg.dropout),
+            nn.Linear(hidden_dim, num_classes),
+        )
         self.set_backbone_trainable(False)
 
     def set_backbone_trainable(self, trainable: bool) -> None:
@@ -555,7 +622,8 @@ class Wav2Vec2Classifier(nn.Module):
         self.backbone.train()
 
     def head_parameters(self) -> List[nn.Parameter]:
-        return [p for p in list(self.dropout.parameters()) + list(self.classifier.parameters()) if p.requires_grad]
+        params = list(self.pre_classifier_norm.parameters()) + list(self.classifier.parameters())
+        return [p for p in params if p.requires_grad]
 
     def backbone_parameters(self) -> List[nn.Parameter]:
         return [p for p in self.backbone.parameters() if p.requires_grad]
@@ -567,7 +635,7 @@ class Wav2Vec2Classifier(nn.Module):
             attention_mask=attention_mask,
             output_hidden_states=False,
         )
-        hidden_states = outputs.last_hidden_state
+        hidden_states = self.frame_dropout(outputs.last_hidden_state)
         if attention_mask is None:
             input_mask = torch.ones(
                 batch["input_values"].size()[:2],
@@ -600,6 +668,7 @@ class Wav2Vec2Classifier(nn.Module):
         masked = hidden_states * mask
         lengths = frame_mask.sum(dim=1, keepdim=True).clamp(min=1).type_as(hidden_states)
         pooled = masked.sum(dim=1) / lengths
+        pooled = self.pre_classifier_norm(pooled)
         logits = self.classifier(self.dropout(pooled))
         return logits, pooled
 
@@ -763,7 +832,7 @@ def main() -> None:
         sampler = WeightedRandomSampler(
             train_dataset.sample_weights,
             num_samples=len(train_dataset),
-            replacement=True,
+            replacement=False,
         )
 
     train_loader = build_dataloader(train_dataset, CONFIG.data, CONFIG.model, CONFIG.train, sampler, shuffle=True)
