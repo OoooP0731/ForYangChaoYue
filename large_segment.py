@@ -731,6 +731,8 @@ def run_training() -> None:
         total_loss = 0.0
         correct = 0
         total_examples = 0
+        train_labels: List[int] = []
+        train_preds: List[int] = []
         amp_enabled = scaler.is_enabled()
         progress = tqdm(train_loader, desc="Training", leave=False)
         for batch, labels, _ in progress:
@@ -750,11 +752,18 @@ def run_training() -> None:
             correct += (preds == labels).sum().item()
             total_examples += labels.size(0)
             total_loss += loss.item()
-            progress.set_postfix(loss=f"{loss.item():.4f}", acc=f"{100 * correct / max(total_examples, 1):.2f}%")
+            train_preds.extend(preds.detach().cpu().tolist())
+            train_labels.extend(labels.detach().cpu().tolist())
+            running_f1 = f1_score(train_labels, train_preds, zero_division=0) if train_labels else 0.0
+            progress.set_postfix(
+                loss=f"{loss.item():.4f}",
+                f1=f"{running_f1:.3f}",
+            )
 
         train_loss = total_loss / max(len(train_loader), 1)
         train_acc = correct / total_examples if total_examples else 0.0
-        logger.info("Train | loss=%.4f | acc=%.4f", train_loss, train_acc)
+        train_f1 = f1_score(train_labels, train_preds, zero_division=0) if train_labels else 0.0
+        logger.info("Train | loss=%.4f | acc=%.4f | f1=%.4f", train_loss, train_acc, train_f1)
 
         val_metrics = evaluate(model, val_loader, CONFIG.device, use_amp=False, split_name=f"val-epoch{epoch}")
         segment_f1 = val_metrics.get("f1", 0.0)
