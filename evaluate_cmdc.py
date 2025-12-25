@@ -541,7 +541,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow huggingface to download weights if not cached locally",
     )
-    return parser.parse_args()
+    args, _ = parser.parse_known_args()
+    return args
 
 
 def main() -> None:
