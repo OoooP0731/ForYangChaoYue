@@ -9,9 +9,11 @@ This module implements a lightweight pipeline that
     * evaluates both segment-level and subject-level metrics.
 """
 
+import argparse
 import logging
 import os
 import random
+import re
 import warnings
 from collections import Counter
 from dataclasses import dataclass, field
@@ -131,6 +133,8 @@ class ExperimentConfig:
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
+    eval_data_dir: str = "./CMDC"
+    eval_checkpoint: str = "best_model_wavlm_lagre.pt"
 
     @property
     def device(self) -> torch.device:
@@ -229,6 +233,101 @@ def load_metadata(data_cfg: DataConfig) -> Tuple[List[str], List[int], List[str]
         labels.count(1),
     )
     return file_paths, labels, subjects
+
+
+def _normalize_token(value: str) -> str:
+    return re.sub(r"[^0-9a-z]+", "", value.lower())
+
+
+def load_cmdc_metadata(cmdc_dir: str) -> Tuple[List[str], List[int], List[str]]:
+    """Collect wav file paths and labels from the CMDC dataset structure."""
+
+    info_path = os.path.join(cmdc_dir, "SubjectInfo.xlsx")
+    if not os.path.exists(info_path):
+        raise FileNotFoundError(f"CMDC metadata file not found: {info_path}")
+
+    df = pd.read_excel(info_path)
+    id_col = next((c for c in df.columns if "id" in c.lower()), None)
+    label_col = next(
+        (
+            c
+            for c in df.columns
+            if any(k in c.lower() for k in ["label", "group", "diagnosis", "mdd"])
+        ),
+        None,
+    )
+    if id_col is None or label_col is None:
+        raise KeyError(
+            "SubjectInfo.xlsx must contain an ID column and a label/group column."
+        )
+
+    label_lookup: Dict[str, int] = {}
+    label_map = {"mdd": 1, "hc": 0, "depressed": 1, "control": 0, "1": 1, "0": 0}
+
+    for _, row in df.iterrows():
+        raw_id = str(row[id_col]).strip()
+        label_raw = str(row[label_col]).strip().lower()
+        label_value: Optional[int] = None
+        for key, mapped in label_map.items():
+            if key in label_raw:
+                label_value = mapped
+                break
+        if label_value is None:
+            continue
+
+        candidates = {
+            _normalize_token(raw_id),
+            _normalize_token(label_raw + raw_id),
+            _normalize_token(raw_id + label_raw),
+            _normalize_token(raw_id.lstrip("0")),
+        }
+        if raw_id.isdigit():
+            candidates.add(_normalize_token(str(int(raw_id))))
+        for cand in candidates:
+            if cand:
+                label_lookup[cand] = label_value
+
+    audio_paths: List[str] = []
+    labels: List[int] = []
+    subjects: List[str] = []
+
+    for group_name in sorted(os.listdir(cmdc_dir)):
+        group_path = os.path.join(cmdc_dir, group_name)
+        if not os.path.isdir(group_path):
+            continue
+        group_norm = group_name.lower()
+        group_label: Optional[int] = None
+        if "mdd" in group_norm:
+            group_label = 1
+        elif any(k in group_norm for k in ["hc", "control", "healthy"]):
+            group_label = 0
+
+        for subject_name in sorted(os.listdir(group_path)):
+            subject_path = os.path.join(group_path, subject_name)
+            if not os.path.isdir(subject_path):
+                continue
+            subject_token = _normalize_token(subject_name)
+            label = label_lookup.get(subject_token, group_label)
+            if label is None:
+                logger.warning("Skipping subject %s (label unknown)", subject_path)
+                continue
+            for root, _, files in os.walk(subject_path):
+                for file in files:
+                    if file.lower().endswith(".wav"):
+                        audio_paths.append(os.path.join(root, file))
+                        labels.append(label)
+                        subjects.append(subject_name)
+
+    logger.info(
+        "Collected %d CMDC audio recordings from %d subjects (HC=%d, MDD=%d)",
+        len(audio_paths),
+        len(set(subjects)),
+        labels.count(0),
+        labels.count(1),
+    )
+    if not audio_paths:
+        raise RuntimeError("No audio files were found in the CMDC directory.")
+    return audio_paths, labels, subjects
 
 
 def split_by_subject(
@@ -827,7 +926,7 @@ def determine_total_epochs(train_cfg: TrainConfig) -> int:
     return train_cfg.pretrained_freeze_epochs + train_cfg.pretrained_finetune_epochs
 
 
-def main() -> None:
+def run_training() -> None:
     setup_logging()
     logger.info("Starting experiment")
     if CONFIG.model.force_offline:
@@ -1073,5 +1172,66 @@ def main() -> None:
     logger.info("Confusion matrix:\n%s", test_result.get("confusion_matrix"))
 
 
+def evaluate_cmdc(cmdc_dir: str, checkpoint_path: str, batch_size: Optional[int] = None) -> None:
+    setup_logging()
+    logger.info("Starting CMDC evaluation")
+    if CONFIG.model.force_offline:
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.makedirs(CONFIG.model.hf_cache_dir, exist_ok=True)
+    os.environ.setdefault("HF_HOME", CONFIG.model.hf_cache_dir)
+
+    if batch_size is not None:
+        CONFIG.train.batch_size = batch_size
+
+    CONFIG.data.apply_augmentation = False
+
+    seed_everything(CONFIG.train.random_seed)
+
+    file_paths, labels, subjects = load_cmdc_metadata(cmdc_dir)
+    data_dict = {"paths": file_paths, "labels": labels, "subjects": subjects}
+    dataset = AudioDataset(data_dict, CONFIG.data, split="test")
+    logger.info("Segmented CMDC audio into %d clips", len(dataset))
+    dataloader = build_dataloader(
+        dataset,
+        CONFIG.data,
+        CONFIG.model,
+        CONFIG.train,
+        sampler=None,
+        shuffle=False,
+    )
+
+    num_classes = len(set(labels)) if labels else 2
+    model = Wav2Vec2Classifier(CONFIG.model, num_classes).to(CONFIG.device)
+    state_dict = torch.load(checkpoint_path, map_location=CONFIG.device)
+    model.load_state_dict(state_dict, strict=False)
+    logger.info("Loaded checkpoint from %s", checkpoint_path)
+
+    metrics = evaluate(model, dataloader, CONFIG.device, use_amp=False, split_name="CMDC")
+    print("\nCMDC Evaluation Results")
+    print(f"  Accuracy:  {metrics.get('segment_acc', 0.0):.4f}")
+    print(f"  Precision: {metrics.get('precision', 0.0):.4f}")
+    print(f"  Recall:    {metrics.get('recall', 0.0):.4f}")
+    print(f"  F1 Score:  {metrics.get('f1', 0.0):.4f}")
+    auc = metrics.get("auc")
+    if auc is not None and not (isinstance(auc, float) and np.isnan(auc)):
+        print(f"  AUC:       {auc:.4f}")
+    else:
+        print("  AUC:       N/A")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train or evaluate wav2vec2 models.")
+    parser.add_argument("--mode", choices=["train", "eval_cmdc"], default="eval_cmdc")
+    parser.add_argument("--cmdc_dir", default=CONFIG.eval_data_dir, help="Path to CMDC dataset root")
+    parser.add_argument("--checkpoint", default=CONFIG.eval_checkpoint, help="Checkpoint file for evaluation")
+    parser.add_argument("--batch_size", type=int, default=None, help="Override evaluation batch size")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    if args.mode == "train":
+        run_training()
+    else:
+        evaluate_cmdc(args.cmdc_dir, args.checkpoint, batch_size=args.batch_size)
