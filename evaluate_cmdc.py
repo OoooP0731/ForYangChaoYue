@@ -98,12 +98,12 @@ def discover_cmdc_segments(
 ) -> List[Dict[str, object]]:
     """Scan the CMDC directory and assemble segment metadata.
 
-    Each subject folder is expected to live inside a group directory whose
-    name contains ``MDD`` or ``HC``.  All ``.wav`` files beneath the subject
-    directory are included.  The function returns a list of dictionaries with
-    keys ``path`` (absolute path), ``label`` (0 or 1), ``subject`` (identifier),
-    and ``offset`` (starting frame for the 7-second segment).  Longer files are
-    split using the configured hop length (based on ``overlap_ratio``).
+    The expected layout is ``CMDC/HC01/Q1.wav ...`` (or ``CMDC/MDD01/...``):
+    top-level folders correspond directly to subjects.  All ``.wav`` files
+    under a subject folder are gathered and split into fixed-length segments
+    using the configured overlap.  Each returned record contains ``path``,
+    ``label`` (0=HC, 1=MDD), ``subject`` (the folder name), and ``offset``
+    (start frame for the segment after resampling to ``sample_rate``).
     """
 
     if not os.path.isdir(cmdc_dir):
@@ -115,72 +115,69 @@ def discover_cmdc_segments(
     samples: List[Dict[str, object]] = []
     subject_counts: Dict[str, int] = {}
 
-    for group_name in sorted(os.listdir(cmdc_dir)):
-        group_path = os.path.join(cmdc_dir, group_name)
-        if not os.path.isdir(group_path):
+    for subject_folder in sorted(os.listdir(cmdc_dir)):
+        subject_path = os.path.join(cmdc_dir, subject_folder)
+        if not os.path.isdir(subject_path):
             continue
-        name_upper = group_name.upper()
-        if "MDD" in name_upper:
+
+        name_upper = subject_folder.upper()
+        if name_upper.startswith("MDD"):
             label = 1
-        elif "HC" in name_upper:
+        elif name_upper.startswith("HC"):
             label = 0
         else:
-            # Skip auxiliary folders that do not correspond to a diagnostic group.
+            # Skip folders that are not subject IDs.
             continue
 
-        for subject_name in sorted(os.listdir(group_path)):
-            subject_path = os.path.join(group_path, subject_name)
-            if not os.path.isdir(subject_path):
+        subject_id = subject_folder
+        subject_counts.setdefault(subject_id, 0)
+
+        wav_files: List[str] = []
+        for root, _, files in os.walk(subject_path):
+            for file in files:
+                if file.lower().endswith(".wav"):
+                    wav_files.append(os.path.join(root, file))
+        wav_files.sort()
+
+        for wav_path in wav_files:
+            num_frames, sample_rate = safe_audio_info(wav_path)
+            if num_frames <= 0:
                 continue
-            subject_id = f"{group_name}/{subject_name}"
-            subject_counts.setdefault(subject_id, 0)
 
-            wav_files: List[str] = []
-            for root, _, files in os.walk(subject_path):
-                for file in files:
-                    if file.lower().endswith(".wav"):
-                        wav_files.append(os.path.join(root, file))
-            wav_files.sort()
+            if sample_rate != data_cfg.sample_rate and sample_rate > 0:
+                resampled_frames = int(round(num_frames * data_cfg.sample_rate / sample_rate))
+            else:
+                resampled_frames = num_frames
 
-            for wav_path in wav_files:
-                num_frames, sample_rate = safe_audio_info(wav_path)
-                if num_frames <= 0:
-                    continue
+            if resampled_frames <= segment_length:
+                samples.append(
+                    {
+                        "path": wav_path,
+                        "label": label,
+                        "subject": subject_id,
+                        "offset": 0,
+                    }
+                )
+                subject_counts[subject_id] += 1
+                continue
 
-                if sample_rate != data_cfg.sample_rate and sample_rate > 0:
-                    resampled_frames = int(round(num_frames * data_cfg.sample_rate / sample_rate))
-                else:
-                    resampled_frames = num_frames
+            start_positions = list(range(0, max(resampled_frames - segment_length + 1, 1), hop_length))
+            if not start_positions:
+                start_positions = [0]
 
-                if resampled_frames <= segment_length:
-                    samples.append(
-                        {
-                            "path": wav_path,
-                            "label": label,
-                            "subject": subject_id,
-                            "offset": 0,
-                        }
-                    )
-                    subject_counts[subject_id] += 1
-                    continue
-
-                start_positions = list(range(0, max(resampled_frames - segment_length + 1, 1), hop_length))
-                if not start_positions:
-                    start_positions = [0]
-
-                for offset in start_positions:
-                    max_segments = data_cfg.max_segments_per_subject
-                    if max_segments is not None and subject_counts[subject_id] >= max_segments:
-                        break
-                    samples.append(
-                        {
-                            "path": wav_path,
-                            "label": label,
-                            "subject": subject_id,
-                            "offset": offset,
-                        }
-                    )
-                    subject_counts[subject_id] += 1
+            for offset in start_positions:
+                max_segments = data_cfg.max_segments_per_subject
+                if max_segments is not None and subject_counts[subject_id] >= max_segments:
+                    break
+                samples.append(
+                    {
+                        "path": wav_path,
+                        "label": label,
+                        "subject": subject_id,
+                        "offset": offset,
+                    }
+                )
+                subject_counts[subject_id] += 1
 
     if not samples:
         raise RuntimeError(
